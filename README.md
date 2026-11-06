@@ -100,4 +100,4 @@ B站https://space.bilibili.com/455976991
 YouTube：https://www.youtube.com/@diyfun
 博客：https://diyforfun.cn/
 
-感谢他提供PS5设备和万兆网卡和万兆局域网的测试环境
+感谢他提供PS5设备和万兆网卡和万兆局域网的测试环境并全程测试与问题汇总反馈。
