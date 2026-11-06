@@ -95,7 +95,9 @@ make ps5
 ## 特别鸣谢
 
 UP主：爱折腾的老高
+频道：
+B站https://space.bilibili.com/455976991
+YouTube：https://www.youtube.com/@diyfun
+博客：https://diyforfun.cn/
 
-视频：https://b23.tv/xODTD4H
-
-他提供了PS5设备和万兆网卡和万兆局域网的测试环境
+感谢他提供PS5设备和万兆网卡和万兆局域网的测试环境
