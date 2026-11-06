@@ -1,0 +1,7 @@
+build/
+build-*/
+.cache
+__pycache__/
+*.pyc
+src/app_assets.c
+.DS_Store
