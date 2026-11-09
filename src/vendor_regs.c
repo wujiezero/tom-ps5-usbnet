@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* See vendor.h. r8156_init(), rtl8156_up() and rtl8156_enable() from Linux's
- * r8152.c for RTL_VER_17, in their order, with these left out:
+ * r8152.c, in their order: for RTL_VER_17 on the RTL8159, and for RTL_VER_12, 13 and 15
+ * on the RTL8156B, whose branches in those functions differ. Left out on both:
  *
  *   - the PHY: no firmware, no SRAM parameters and no OCP register. In the vendor
  *     configuration PLA_PHYSTATUS already showed a 10 Gbit/s link, so the chip's own
@@ -56,6 +57,13 @@
 #define PLA_MISC_1 0xe85a
 #define PLA_TALLY 0xe890
 #define PLA_SFF_STS_7 0xe8de
+#define PLA_POL_GPIO_CTRL 0xdc6a
+#define PLA_CPCR 0xe854
+#define USB_U2P3_CTRL 0xb460
+#define USB_SPEED_OPTION 0xd32a
+#define USB_FW_CTRL 0xd334
+#define USB_FC_TIMER 0xd340
+#define USB_FW_TASK 0xd4e8
 #define USB_MSC_TIMER 0xcbfc
 #define USB_LPM_CONFIG 0xcfd8
 #define USB_ECM_OPTION 0xcfee
@@ -101,6 +109,24 @@
 #define POLL_LINK_CHG BIT(0)
 #define CR_TE 0x04u
 #define CR_RE 0x08u
+#define CR_RST 0x10u
+#define SLOT_EN BIT(11)
+#define FLOW_CTRL_EN BIT(0)
+#define CTRL_TIMER_EN BIT(15)
+#define DACK_DET_EN BIT(15)
+#define FLOW_CTRL_PATCH_2 BIT(8)
+#define AUTO_SPEEDUP BIT(3)
+#define FC_PATCH_TASK BIT(1)
+#define RX_DETECT8 BIT(3)
+#define U2P3_ENABLE BIT(0)
+#define RG_PWRDN_EN BIT(8)
+#define ALL_SPEED_OFF BIT(9)
+#define IDLE_SPDWN_EN BIT(6)
+#define RX_AGG_DISABLE 0x0010u
+#define RX_ZERO_EN 0x0080u
+#define VER_12 0x7400                   /* the one RTL8156B without the flash wait */
+#define RESET_TRIES 1000
+#define RESET_POLL_US 250
 #define RXDY_GATED 0x0008u
 #define ADV_BUSY BIT(0)
 #define ADV_WRITE BIT(1)
@@ -116,8 +142,8 @@ struct step {
     uint32_t clear, set;
 };
 
-/* r8156_init() */
-static const struct step g_init[] = {
+/* r8156_init(), RTL_VER_17 */
+static const struct step g_init_8159[] = {
     {"undocumented USB 0xcffe", USB, 0xcffe, 1, 0, 0, BIT(3)},
     {"undocumented USB 0xd3ca", USB, 0xd3ca, 1, 0, BIT(0), 0},
     {"ECM_OP.EN_ALL_SPEED", USB, USB_ECM_OP, 1, 0, BIT(0), 0},
@@ -136,7 +162,38 @@ static const struct step g_init[] = {
     {"reset tally", PLA, PLA_RSTTALLY, 2, 0, 0, BIT(0)},
 };
 
-/* rtl8156_up(), up to the BMU reset */
+/* r8156_init(), RTL_VER_12 to 15, up to USB_FW_CTRL. The U1/U2 and U2P3 power states
+ * stay off: Linux turns them back on, and they only save power. */
+static const struct step g_init_8156b[] = {
+    {"ECM_OP.EN_ALL_SPEED", USB, USB_ECM_OP, 1, 0, BIT(0), 0},
+    {"SPEED_OPTION", USB, USB_SPEED_OPTION, 2, 0, 0xffff, 0},
+    {"ECM_OPTION.BYPASS_MAC_RESET", USB, USB_ECM_OPTION, 2, 0, 0, BIT(5)},
+    {"U2P3_CTRL.RX_DETECT8", USB, USB_U2P3_CTRL, 2, 0, 0, RX_DETECT8},
+    {"LPM_CONFIG.U1U2_EN", USB, USB_LPM_CONFIG, 2, 0, BIT(0), 0},
+    {"U2P3_CTRL.U2P3_ENABLE", USB, USB_U2P3_CTRL, 2, 0, U2P3_ENABLE, 0},
+    {"MSC_TIMER", USB, USB_MSC_TIMER, 2, 0, 0xffff, 0x0fff},
+    {"U1U2_TIMER", USB, USB_U1U2_TIMER, 2, 0, 0xffff, 500},
+    {"POWER_CUT.PWR_EN", USB, USB_POWER_CUT, 2, 0, BIT(0), 0},
+    {"MISC_0.PCUT_STATUS", USB, USB_MISC_0, 2, 0, PCUT_STATUS, 0},
+    {"POWER_CUT.UPS", USB, USB_POWER_CUT, 1, 0, BIT(4) | BIT(5), 0},
+    {"MISC_2.UPS_FORCE_PWR_DOWN", USB, USB_MISC_2, 1, 0, BIT(0), 0},
+    /* Linux clears SLOT_EN alone; the filter goes shut here as well, which rtl8156_up()
+     * does anyway, so that nothing is taken in before a transfer waits for it. */
+    {"RCR.SLOT_EN, accept nothing", PLA, PLA_RCR, 2, 0, SLOT_EN | RCR_ACPT_ALL, 0},
+    {"CPCR.FLOW_CTRL_EN", PLA, PLA_CPCR, 2, 0, 0, FLOW_CTRL_EN},
+    {"FC_TIMER: 600 ms", USB, USB_FC_TIMER, 2, 0, 0xffff, CTRL_TIMER_EN | (600 / 8)},
+};
+
+/* The rest of r8156_init(), RTL_VER_12 to 15, after USB_FW_CTRL. */
+static const struct step g_init_8156b_tail[] = {
+    {"FW_TASK.FC_PATCH_TASK", USB, USB_FW_TASK, 2, 0, 0, FC_PATCH_TASK},
+    {"MAC_PWR_CTRL3.MCU_SPDWN_EN", PLA, PLA_MAC_PWR_CTRL3, 2, 0, BIT(14), 0},
+    {"EXTRA_STATUS.POLL_LINK_CHG", PLA, PLA_EXTRA_STATUS, 2, 0, 0, POLL_LINK_CHG},
+    {"USB_CTRL: aggregate, no zero length", USB, USB_USB_CTRL, 2, 0, RX_AGG_DISABLE | RX_ZERO_EN, 0},
+    {"reset tally", PLA, PLA_RSTTALLY, 2, 0, 0, BIT(0)},
+};
+
+/* rtl8156_up(), up to rtl8152_nic_reset() */
 static const struct step g_up_stop[] = {
     {"MISC_1.RXDY_GATED on", PLA, PLA_MISC_1, 2, 0, 0, RXDY_GATED},
     {"TEREDO_CFG", PLA, PLA_TEREDO_CFG, 1, 1, 0xff, 0xff},
@@ -144,13 +201,21 @@ static const struct step g_up_stop[] = {
     {"REALWOW_TIMER", PLA, PLA_REALWOW_TIMER, 2, 0, 0xffff, 0},
     {"TEREDO_TIMER", PLA, PLA_TEREDO_TIMER, 4, 0, 0xffffffffu, 0},
     {"RCR: accept nothing", PLA, PLA_RCR, 4, 0, RCR_ACPT_ALL, 0},
+};
+
+/* rtl8152_nic_reset() for RTL_VER_17; the RTL8156B's is reset_mac(). */
+static const struct step g_stop_8159[] = {
     {"CR: stop", PLA, PLA_CR, 1, 0, CR_RE | CR_TE, 0},
+};
+
+/* rtl_reset_bmu() */
+static const struct step g_bmu_reset[] = {
     {"BMU_RESET: assert", USB, USB_BMU_RESET, 1, 0, 0x03, 0},
     {"BMU_RESET: release", USB, USB_BMU_RESET, 1, 0, 0, 0x03},
 };
 
-/* the rest of rtl8156_up(), then rtl8156_enable() */
-static const struct step g_up_enable[] = {
+/* the rest of rtl8156_up(), then rtl8156_enable(), RTL_VER_17 */
+static const struct step g_up_enable_8159[] = {
     {"OOB_CTRL.NOW_IS_OOB", PLA, PLA_OOB_CTRL, 1, 0, 0x80, 0},
     {"RCR1 bit 3", PLA, PLA_RCR1, 2, 0, BIT(3), 0},
     {"SFF_STS_7.MCU_BORW_EN", PLA, PLA_SFF_STS_7, 2, 0, 0x4000, 0},
@@ -169,6 +234,38 @@ static const struct step g_up_enable[] = {
     {"RX_EARLY_TIMEOUT", USB, USB_RX_EARLY_TIMEOUT, 2, 0, 0xffff, EARLY_TIMEOUT},
     {"TCR1: 96 ns gap", PLA, PLA_TCR1, 2, 0, BIT(3) | BIT(9) | BIT(8), BIT(9) | BIT(8)},
     {"MAC_PWR_CTRL4.TX10MIDLE_EN", PLA, PLA_MAC_PWR_CTRL4, 2, 0, 0, 0x0100},
+};
+
+/* the rest of rtl8156_up(), then rtl8156_enable() up to the early size, RTL_VER_12 to
+ * 15. Idle speed-down stays off whatever the rate: Linux leaves it off at 2.5 Gbit/s. */
+static const struct step g_up_enable_8156b[] = {
+    {"OOB_CTRL.NOW_IS_OOB", PLA, PLA_OOB_CTRL, 1, 0, 0x80, 0},
+    {"SFF_STS_7.MCU_BORW_EN", PLA, PLA_SFF_STS_7, 2, 0, 0x4000, 0},
+    {"RCR1: no VLAN stripping", PLA, PLA_RCR1, 2, 0, VLAN_STRIP, 0},
+    {"RMS", PLA, PLA_RMS, 2, 0, 0xffff, RX_MAX_SIZE},
+    {"MTPS", PLA, PLA_MTPS, 1, 0, 0xff, MTPS_JUMBO},
+    {"RX_FIFO_FULL", PLA, PLA_RX_FIFO_FULL, 2, 0, 0xffff, FC_PAUSE_ON},
+    {"RX_FIFO_EMPTY", PLA, PLA_RX_FIFO_EMPTY, 2, 0, 0xffff, FC_PAUSE_OFF},
+    {"TXFIFO_CTRL", PLA, PLA_TXFIFO_CTRL, 2, 0, 0xffff, 512 / 64},
+    {"TXFIFO_FULL", PLA, PLA_TXFIFO_FULL, 2, 0, 0xffff, TX_FIFO_FULL},
+    {"RXFIFO_FULL: share FIFO", PLA, PLA_RXFIFO_FULL, 2, 0, 0x0fff, 0x08},
+    {"MAC_PWR_CTRL3.MCU_SPDWN_EN", PLA, PLA_MAC_PWR_CTRL3, 2, 0, BIT(14), 0},
+    {"SPEED_OPTION: no power-down", USB, USB_SPEED_OPTION, 2, 0, RG_PWRDN_EN | ALL_SPEED_OFF, 0},
+    {"RX_BUF_TH", USB, USB_RX_BUF_TH, 4, 0, 0xffffffffu, 0x00600400},
+    {"EEEP_CR.EEEP_TX", PLA, PLA_EEEP_CR, 2, 0, 0x0002, 0},
+    {"RX_AGGR_NUM", USB, USB_RX_AGGR_NUM, 2, 0, 0x01ff, 0},
+    {"RX_EARLY_TIMEOUT", USB, USB_RX_EARLY_TIMEOUT, 2, 0, 0xffff, EARLY_TIMEOUT},
+    {"TCR1: 96 ns gap", PLA, PLA_TCR1, 2, 0, BIT(3) | BIT(9) | BIT(8), BIT(9) | BIT(8)},
+    {"MAC_PWR_CTRL4.TX10MIDLE_EN", PLA, PLA_MAC_PWR_CTRL4, 2, 0, 0, 0x0100},
+    {"MAC_PWR_CTRL4.IDLE_SPDWN_EN", PLA, PLA_MAC_PWR_CTRL4, 2, 0, IDLE_SPDWN_EN, 0},
+};
+
+/* The end of rtl8156_enable(), RTL_VER_12 to 15: the flow-control task restarts. */
+static const struct step g_fc_patch_off[] = {
+    {"FW_TASK.FC_PATCH_TASK off", USB, USB_FW_TASK, 2, 0, FC_PATCH_TASK, 0},
+};
+static const struct step g_fc_patch_on[] = {
+    {"FW_TASK.FC_PATCH_TASK on", USB, USB_FW_TASK, 2, 0, 0, FC_PATCH_TASK},
 };
 
 /* rtl_enable() */
@@ -196,10 +293,32 @@ static const struct step g_stop[] = {
 
 static int g_fd = -1;
 static int g_early_kib, g_coalesce_us;
+static enum rtl_chip g_chip = RTL_8159;
+static uint16_t g_version;
 
-void vnd_regs_attach(int fd)
+void vnd_regs_attach(int fd, enum rtl_chip chip, uint16_t version)
 {
     g_fd = fd;
+    g_chip = chip;
+    g_version = version;
+    g_early_kib = g_coalesce_us = 0;
+}
+
+unsigned vnd_regs_max_mbps(void)
+{
+    return g_chip == RTL_8156B ? 2500 : 10000;
+}
+
+uint16_t vnd_regs_read_version(int fd)
+{
+    uint8_t setup[8], data[4];
+    uint16_t version = 0;
+    int tries;
+
+    if (rtl_version_request(setup) != 0) return 0;
+    for (tries = 0; tries < 3; tries++)         /* as __rtl_get_hw_ver() does */
+        if (adapter_control_in(fd, setup, data) == 4 && rtl_version_reply(data, 4, &version) == 0) return version;
+    return 0;
 }
 
 static int read_block(unsigned mcu, unsigned address, uint8_t *data, unsigned size)
@@ -304,17 +423,58 @@ static int clear_rx_zero_length(void)
     return wait_bits(USB, USB_ADV_CMD, ADV_BUSY, 0);
 }
 
+/* r8156b_wait_loading_flash() (not on RTL_VER_12), the autoload, and on the RTL8159
+ * r8159_wait_backup_restore(). */
 static void wait_for_chip(void)
 {
     uint32_t gphy = 0, bypass = 0, misc = 0;
 
-    if (read_register(PLA, PLA_GPHY_CTRL, 2, &gphy) == 0 && read_register(USB, USB_GPHY_CTRL, 2, &bypass) == 0 &&
+    if ((g_chip == RTL_8159 || g_version != VER_12) &&
+            read_register(PLA, PLA_GPHY_CTRL, 2, &gphy) == 0 && read_register(USB, USB_GPHY_CTRL, 2, &bypass) == 0 &&
             (gphy & GPHY_FLASH) && !(bypass & BYPASS_FLASH) && wait_bits(USB, USB_GPHY_CTRL, GPHY_PATCH_DONE, GPHY_PATCH_DONE) != 0)
         say("  flash loading did not finish");
     if (wait_bits(PLA, PLA_BOOT_CTRL, AUTOLOAD_DONE, AUTOLOAD_DONE) != 0) say("  autoload did not finish");
-    if (read_register(USB, USB_MISC_0, 2, &misc) == 0 && (misc & PCUT_STATUS) &&
+    if (g_chip == RTL_8159 && read_register(USB, USB_MISC_0, 2, &misc) == 0 && (misc & PCUT_STATUS) &&
             wait_bits(USB, USB_GPHY_CTRL, BACKUP_RESTORE, BACKUP_RESTORE) != 0)
         say("  backup-restore did not finish");
+}
+
+/* The USB_FW_CTRL step of r8156_init(), RTL_VER_12 to 15: one bit depends on another
+ * register. */
+static int flow_control_patch(void)
+{
+    uint32_t gpio, value;
+    struct step s = {"FW_CTRL", USB, USB_FW_CTRL, 2, 0, 0xffff, 0};
+
+    if (read_register(PLA, PLA_POL_GPIO_CTRL, 2, &gpio) != 0 || read_register(USB, USB_FW_CTRL, 2, &value) != 0) {
+        say("FW_CTRL: read failed, errno %d", errno);
+        return -1;
+    }
+    if (!(gpio & DACK_DET_EN)) value |= FLOW_CTRL_PATCH_2;
+    s.set = value & ~AUTO_SPEEDUP;
+    return apply(&s);
+}
+
+/* rtl8152_nic_reset() for RTL_VER_12 to 15: the reset bit clears itself. */
+static int reset_mac(void)
+{
+    uint32_t value = CR_RST;
+    int i;
+
+    checkpoint();
+    if (write_register(PLA, PLA_CR, 1, CR_RST) != 0) {
+        say("CR: reset failed, errno %d", errno);
+        return -1;
+    }
+    for (i = 0; i < RESET_TRIES && (value & CR_RST); i++) {
+        usleep(RESET_POLL_US);
+        if (read_register(PLA, PLA_CR, 1, &value) != 0) return -1;
+    }
+    if (value & CR_RST) {
+        say("CR: the reset did not finish");
+        return -1;
+    }
+    return 0;
 }
 
 /* __rtl8152_set_mac_address(), in two writes. */
@@ -338,9 +498,12 @@ int vnd_regs_address_matches(const uint8_t mac[6])
     return memcmp(data, mac, 6) == 0;
 }
 
+/* r8153_set_rx_early_size(): in units of 16 bytes on the RTL8159 and 8 on the RTL8156B.
+ * RX_RESERVED is the same for both: 16 + 16 there, 24 + 8 here. */
 static int set_aggregation(int early_kib, int coalesce_us)
 {
-    uint32_t early = ((uint32_t)early_kib * 1024 - RX_RESERVED) / 16, timer = (uint32_t)coalesce_us * 1000 / 8;
+    uint32_t unit = g_chip == RTL_8156B ? 8 : 16;
+    uint32_t early = ((uint32_t)early_kib * 1024 - RX_RESERVED) / unit, timer = (uint32_t)coalesce_us * 1000 / 8;
     const struct step size = {"RX_EARLY_SIZE", USB, USB_RX_EARLY_SIZE, 2, 0, 0xffff, early};
     const struct step wait = {"RX_EXTRA_AGGR_TMR", USB, USB_RX_EXTRA_AGGR_TMR, 2, 0, 0xffff, timer};
 
@@ -365,15 +528,28 @@ int vnd_regs_bring_up(const uint8_t mac[6])
     int matches;
 
     wait_for_chip();
-    if (APPLY(g_init) != 0) return -1;
-    if (clear_rx_zero_length() != 0) {
-        say("  BMU access failed");
-        return -1;
+    if (g_chip == RTL_8156B) {
+        if (APPLY(g_init_8156b) != 0 || flow_control_patch() != 0 || APPLY(g_init_8156b_tail) != 0) return -1;
+    } else {
+        if (APPLY(g_init_8159) != 0) return -1;
+        if (clear_rx_zero_length() != 0) {
+            say("  BMU access failed");
+            return -1;
+        }
     }
     if (APPLY(g_up_stop) != 0) return -1;
+    if (g_chip == RTL_8156B ? reset_mac() != 0 : APPLY(g_stop_8159) != 0) return -1;
+    if (APPLY(g_bmu_reset) != 0) return -1;
     matches = vnd_regs_address_matches(mac);
     if (matches < 0 || (!matches && write_address(mac) != 0)) return -1;
-    if (APPLY(g_up_enable) != 0 || set_aggregation(VND_MAX_EARLY, VND_LINUX_COALESCE) != 0) return -1;
+    if (g_chip == RTL_8156B) {
+        if (APPLY(g_up_enable_8156b) != 0 || set_aggregation(VND_MAX_EARLY, VND_LINUX_COALESCE) != 0 || APPLY(g_fc_patch_off) != 0)
+            return -1;
+        usleep(1500);
+        if (APPLY(g_fc_patch_on) != 0) return -1;
+    } else if (APPLY(g_up_enable_8159) != 0 || set_aggregation(VND_MAX_EARLY, VND_LINUX_COALESCE) != 0) {
+        return -1;
+    }
     return APPLY(g_enable);
 }
 

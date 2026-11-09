@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* See vendor.h. The chip's own framing: one bulk transfer holds many frames, each after
- * a 16-byte descriptor and on a 16-byte boundary, and USB sees one frame.
+ * a descriptor and on a boundary of the chip's (16 bytes and 16 on the RTL8159; 8 and 4
+ * going out, 24 and 8 coming in, on the RTL8156B), and USB sees one frame.
  *
  * Sending: frames are copied into the transfer being filled, which starts at once if
  * fewer than `queue` transfers are in flight, so a lone frame never waits. Under load
@@ -27,7 +28,6 @@
 #define EP_COUNT (EP_TX0 + TX_TRANSFERS)
 #define MAX_FRAMES (VND_RX_BYTES / 80)  /* a minimum frame with FCS and descriptor */
 #define MIN_FRAME 60
-#define TX_ALIGN 16u
 #define TX_TIMEOUT_MS 1000
 #define RESERVE_TIMEOUT_MS 500L
 #define POLL_MS 20
@@ -35,6 +35,9 @@
 #define MAX_RX_ERRORS 1000
 #define MAX_LOGGED 8
 #define USB_STATUS_STALLED 22
+
+static size_t g_tx_align = 16, g_tx_header = 16;
+static enum rtl_chip g_chip = RTL_8159;
 
 struct tx_transfer {
     int busy, frames;
@@ -217,7 +220,7 @@ static void deliver_transfer(int i, size_t len)
 {
     size_t count = 0, k;
 
-    rtl_8159_rx_scan(g_rx_data[i], len, g_views, MAX_FRAMES, &count);
+    rtl_rx_scan(g_chip, g_rx_data[i], len, g_views, MAX_FRAMES, &count);
 
     for (k = 0; k < count; k++) {
         g_frames[k].data = g_views[k].data;
@@ -295,12 +298,17 @@ static int open_endpoint(int index, unsigned endpoint, uint32_t bufsize, uint32_
     return 0;
 }
 
-int vnd_open(int fd, unsigned bulk_in, unsigned bulk_out, const struct vnd_hooks *hooks)
+int vnd_open(int fd, enum rtl_chip chip, unsigned bulk_in, unsigned bulk_out, const struct vnd_hooks *hooks)
 {
     struct usb_fs_init init;
+    struct rtl_format format;
     uint32_t got = 0, packet = 0;
     int i;
 
+    if (rtl_get_format(chip, &format) != 0) return -1;
+    g_chip = chip;
+    g_tx_align = format.tx_align;
+    g_tx_header = format.tx_header;
     memset(&g, 0, sizeof g);
     g.fd = fd;
     g.hooks = *hooks;
@@ -405,7 +413,7 @@ int vnd_gone(void)
 
 static size_t next_header(const struct tx_transfer *t)
 {
-    return (t->used + TX_ALIGN - 1) & ~(size_t)(TX_ALIGN - 1);
+    return (t->used + g_tx_align - 1) & ~(g_tx_align - 1);
 }
 
 uint8_t *vnd_tx_reserve(void)
@@ -426,8 +434,8 @@ uint8_t *vnd_tx_reserve(void)
         if (g.fill >= 0) {
             size_t header = next_header(&g.tx[g.fill]);
 
-            if (header + RTL_8159_HEADER + MAX_FRAME <= (size_t)g.set.tx_bytes)
-                return g_tx_data[g.fill] + header + RTL_8159_HEADER;  /* the commit unlocks */
+            if (header + g_tx_header + MAX_FRAME <= (size_t)g.set.tx_bytes)
+                return g_tx_data[g.fill] + header + g_tx_header;  /* the commit unlocks */
         }
         if (now_ns() >= deadline) break;
         if (!reap()) {
@@ -444,14 +452,14 @@ void vnd_tx_commit(size_t len)
 {
     struct tx_transfer *t = &g.tx[g.fill];
     size_t header = next_header(t);
-    uint8_t *slot = g_tx_data[g.fill] + header + RTL_8159_HEADER;
+    uint8_t *slot = g_tx_data[g.fill] + header + g_tx_header;
 
     if (len < MIN_FRAME) {
         memset(slot + len, 0, MIN_FRAME - len);
         len = MIN_FRAME;
     }
-    rtl_8159_tx_header(g_tx_data[g.fill] + header, len);
-    t->used = header + RTL_8159_HEADER + len;
+    rtl_tx_header(g_chip, g_tx_data[g.fill] + header, len);
+    t->used = header + g_tx_header + len;
     t->frames++;
     launch();
     pthread_mutex_unlock(&g_lock);

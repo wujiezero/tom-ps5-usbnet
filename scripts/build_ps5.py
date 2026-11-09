@@ -19,9 +19,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ["src/main.c", "src/adapter.c", "src/log.c", "src/vendor.c", "src/vendor_regs.c", "src/net.c", "src/http_server.c",
-           "src/app_assets.c", "src/files.c", "src/tile.c", "src/crash.c", "src/local_http.c", "src/ncm.c", "src/rtl.c", "port/sys_arch.c"]
+           "src/app_assets.c", "src/files.c", "src/tile.c", "src/crash.c", "src/local_http.c", "src/ncm.c", "src/rtl.c", "src/smb.c", "src/smb_client.c", "src/smb_net.c",
+           "src/smb_lwip.c", "port/sys_arch.c"]
 LWIP_DIRECTORIES = ["third_party/lwip/src/core", "third_party/lwip/src/core/ipv4", "third_party/lwip/src/api"]
 FLAGS = ["-DUN_COND_REALTIME", "-Iport", "-Ithird_party/lwip/src/include"]
+# libsmb2 is third-party: no -Werror. Its socket calls go to src/smb_net.c (include/smb_sock.h).
+SMB2_FLAGS = ["-DHAVE_CONFIG_H", "-Ithird_party/libsmb2", "-Ithird_party/libsmb2/include",
+              "-Ithird_party/libsmb2/include/smb2", "-include", "include/smb_sock.h", "-w"]
 LIBS = ["-lSceIpmi", "-lSceAppInstUtil"]        # in this order: see src/tile.c
 OUTPUT = "tom-ps5-usbnet.elf"
 SDK_LINK_SCRIPT = "ldscripts/elf_x86_64.x"
@@ -190,13 +194,16 @@ def main():
     zig_include = str(zig / "lib/include")
 
     compiled = []
-    sources = [(source, ["-Wall", "-Wextra", "-Werror"]) for source in SOURCES]
+    sources = [(source, ["-Wall", "-Wextra", "-Werror", "-Ithird_party/libsmb2/include"]) for source in SOURCES]
     pinned_input("lwip", "third_party/lwip", "85a09ebe68c260d4876e800220588e5a0b624266c994cc25da978210c2813f14")
     for directory in LWIP_DIRECTORIES:
         sources += [(str(path.relative_to(ROOT)), []) for path in sorted((ROOT / directory).glob("*.c"))]
     sources.append(("third_party/lwip/src/netif/ethernet.c", []))
+    # Both libsmb2 and lwIP have an init.c: libsmb2's objects get a prefix.
+    sources += [(str(path.relative_to(ROOT)), SMB2_FLAGS) for path in sorted((ROOT / "third_party/libsmb2/lib").glob("*.c"))]
     for source, warnings in sources:
-        result = objects / (Path(source).stem + ".o")
+        prefix = "smb2-" if source.startswith("third_party/libsmb2/") else ""
+        result = objects / (prefix + Path(source).stem + ".o")
         run([zig_bin, "clang", "-target", "x86_64-sie-ps5", "-O2", "-fPIC",
              "-fvisibility-nodllstorageclass=default", "-fno-stack-protector", "-fno-plt",
              "-femulated-tls", f"-ffile-prefix-map={ROOT}=."] + warnings + ["-Iinclude"] + FLAGS +

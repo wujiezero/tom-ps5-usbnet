@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #ifndef VENDOR_H
 #define VENDOR_H
-/* The RTL8159's own configuration: what Linux's r8152 driver does, without the PHY.
- * vendor.c moves aggregated bulk transfers, vendor_regs.c sets the chip up. */
+/* The vendor configuration of the RTL8159 and the RTL8156B: what Linux's r8152 driver
+ * does, without the PHY. vendor.c moves aggregated bulk transfers, vendor_regs.c sets
+ * the chip up. */
 #include "frame.h"
 #include "rtl.h"
 
@@ -10,6 +11,7 @@
 #define VND_MAX_QUEUE 4                 /* bulk OUT transfers that can be in flight */
 #define VND_RX_BYTES (48 * 1024)        /* Linux's rx_buf_sz for this chip */
 #define VND_TX_BYTES (60 * 1024)
+#define VND_LINUX_TX_BYTES (16 * 1024)   /* agg_buf_sz */
 #define VND_MIN_TX 4096
 #define VND_MIN_EARLY 8                 /* KiB */
 #define VND_MAX_EARLY 48
@@ -25,7 +27,7 @@ struct vnd_hooks {
 
 /* ---- the data path ---- */
 /* Opens every transfer on these endpoints of the active configuration. */
-int vnd_open(int fd, unsigned bulk_in, unsigned bulk_out, const struct vnd_hooks *hooks);
+int vnd_open(int fd, enum rtl_chip chip, unsigned bulk_in, unsigned bulk_out, const struct vnd_hooks *hooks);
 int vnd_start(void);                    /* starts the receive thread */
 void vnd_close(void);
 void vnd_configure(const struct vnd_settings *settings);
@@ -39,7 +41,12 @@ void vnd_lock(void);
 void vnd_unlock(void);
 
 /* ---- the chip ---- */
-void vnd_regs_attach(int fd);
+/* `version` is PLA_TCR0's, as rtl_version_reply gives it. */
+void vnd_regs_attach(int fd, enum rtl_chip chip, uint16_t version);
+/* The fastest link the chip has: 10000 or 2500. */
+unsigned vnd_regs_max_mbps(void);
+/* PLA_TCR0's version, read before anything is written. 0 if it could not be read. */
+uint16_t vnd_regs_read_version(int fd);
 /* Whether the chip's address is `mac`. 1: yes, 0: no, -1: unreadable. */
 int vnd_regs_address_matches(const uint8_t mac[6]);
 /* The driver's bring-up without PHY, firmware or power writes. Stops at the first

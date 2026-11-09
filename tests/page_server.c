@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Serves the page on 127.0.0.1, so that a real browser can walk all of it: only the page,
- * http_serve and the real file routes on a folder. No USB and no lwIP. */
+ * http_serve and the real file and NAS routes on folders (the NAS is smb_fake.c, its
+ * shares the folders in the third argument, if given). No USB and no lwIP. Set
+ * PAGE_NATIVE=1 for the page as it is without an adapter. */
 #include "files.h"
+#include "smb.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -18,7 +21,10 @@ static int g_stop;
 static int info(void *c, char *out, size_t n)
 {
     (void)c;
-    snprintf(out, n, "{\"name\":\"tom-ps5-usbnet\",\"version\":\"test\",\"ip\":\"192.0.2.50\",\"link_mbps\":10000}");
+    if (getenv("PAGE_NATIVE"))
+        snprintf(out, n, "{\"name\":\"tom-ps5-usbnet\",\"version\":\"test\",\"mode\":\"native\",\"ip\":\"192.0.2.50\",\"port\":9190,\"link_mbps\":0,\"max_mbps\":0}");
+    else
+        snprintf(out, n, "{\"name\":\"tom-ps5-usbnet\",\"version\":\"test\",\"mode\":\"usb\",\"ip\":\"192.0.2.50\",\"port\":80,\"link_mbps\":2500,\"max_mbps\":2500}");
     return 0;
 }
 
@@ -26,11 +32,14 @@ static void stop(void *c) { (void)c; g_stop = 1; }
 
 static int route(void *c, const struct http_request *r, struct http_stream *stream)
 {
+    int result;
+
     (void)c;
     if (!strcmp(r->path, "/tile/status")) return http_respond(stream, 200, "application/json", "{\"state\":\"installed\",\"error\":\"\"}");
     if (!strcmp(r->path, "/tile/remove")) return http_respond(stream, 200, "application/json", "{\"state\":\"removed\",\"error\":\"\"}");
     if (!strcmp(r->path, "/tile/install")) return http_respond(stream, 200, "application/json", "{}");
-    return files_route(r, stream);
+    result = smb_route(r, stream);
+    return result != HTTP_NOT_MINE ? result : files_route(r, stream);
 }
 
 static const struct http_backend g_backend = {.route = route, .info = info, .stop = stop};
@@ -54,7 +63,7 @@ int main(int argc, char **argv)
     int on = 1, listener = socket(AF_INET, SOCK_STREAM, 0);
 
     if (argc < 3) {
-        fprintf(stderr, "usage: page-server port folder\n");
+        fprintf(stderr, "usage: page-server port folder [nas-folder]\n");
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
@@ -64,6 +73,14 @@ int main(int argc, char **argv)
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
     files_test_root = argv[2];
+    if (argc > 3) {
+        static char store[1024];
+        extern const char *smb_fake_root;
+
+        smb_fake_root = argv[3];
+        snprintf(store, sizeof store, "%s/../page-server-nas.txt", argv[3]);
+        smb_set_store(store);
+    }
     if (bind(listener, (struct sockaddr *)&address, sizeof address) != 0 || listen(listener, 16) != 0) {
         perror("listen");
         return 1;

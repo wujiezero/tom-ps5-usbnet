@@ -6,7 +6,9 @@
 #include <stdint.h>
 
 #define TILE_TITLE_ID "PSUN00001"
+#ifndef TILE_PORT
 #define TILE_PORT 9190               /* ps5upload's own page is on 9180 */
+#endif
 
 /* Root, every capability, out of the sandbox: what ps5upload does at start.
  * -1 if the kernel could not be reached. Logged either way. */

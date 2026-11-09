@@ -76,7 +76,7 @@ int rtl_parse_config(const uint8_t *data, size_t len,
 /* chip_version is PLA_TCR1 register value, NOT USB bcdDevice. Reference Realtek
  * VID/PIDs plus compatible observed silicon revision are required. Returns only
  * a target family declaration, not proof of commercial adapter compatibility.
- * 8156B: 0x7400/0x7410; 8159: 0x2020 (mask 0x7cf0). OEM IDs fail closed. */
+ * 8156B: 0x7400/0x7410/0x7420; 8159: 0x2020 (mask 0x7cf0). OEM IDs fail closed. */
 int rtl_identify_target(const struct rtl_usb_device *device,
     uint16_t chip_version, enum rtl_chip *out);
 /* Pure 8-byte USB SETUP data for the upstream read-only PLA_TCR0 version
@@ -104,14 +104,14 @@ unsigned rtl_byte_write_index(unsigned mcu, unsigned address);
  * must be aligned to it. */
 struct rtl_write { uint8_t setup[8], data[4]; };
 int rtl_write_request(struct rtl_write *out, unsigned mcu, unsigned address, unsigned width, uint32_t value);
-/* The 16-byte TX descriptor of one RTL8159 frame of `len` bytes, no offload. */
-#define RTL_8159_HEADER 16u
-int rtl_8159_tx_header(uint8_t header[RTL_8159_HEADER], size_t len);
-/* Walks an RTL8159 bulk IN aggregate as Linux's rx_bottom does: every frame before
- * the first bad descriptor is published, so one bad frame costs only what follows
- * it. `count` is always set. Returns 0 if the whole buffer was walked, else why it
- * stopped. */
-int rtl_8159_rx_scan(const uint8_t *data, size_t len, struct rtl_frame_view *frames, size_t capacity, size_t *count);
+/* The TX descriptor of one frame of `len` bytes, no offload: 8 bytes on the RTL8156B,
+ * 16 on the RTL8159. Returns its length, or RTL_EINVAL. */
+#define RTL_MAX_TX_HEADER 16u
+int rtl_tx_header(enum rtl_chip chip, uint8_t *header, size_t len);
+/* Walks a bulk IN aggregate as Linux's rx_bottom does: every frame before the first bad
+ * descriptor is published, so one bad frame costs only what follows it. `count` is
+ * always set. Returns 0 if the whole buffer was walked, else why it stopped. */
+int rtl_rx_scan(enum rtl_chip chip, const uint8_t *data, size_t len, struct rtl_frame_view *frames, size_t capacity, size_t *count);
 int rtl_tally_reply(const uint8_t *data, size_t len, struct rtl_tally *out);
 int rtl_phy_status_request(uint8_t setup[8]);
 int rtl_phy_status_reply(const uint8_t *data, size_t len, uint16_t *status);

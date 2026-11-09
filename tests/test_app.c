@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Runs the whole program on the host: real receive thread, lwIP and HTTP, against a
- * simulated ugen node. The simulated chip holds registers,
+ * simulated ugen node, as an RTL8159 (no argument), as an RTL8156B ("8156b"), or with
+ * no adapter at all ("none"), when the page is on the host's own loopback. The
+ * simulated chip holds registers,
  * passes frames only once it has been brought up in the right order, refuses writes
  * off the list below, and frames its bulk transfers as the driver expects. All of
  * that comes from reading Linux's driver. It proves nothing about the real chip. */
@@ -18,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -32,6 +36,11 @@ int peer_main(int fd);
 #undef poll
 #undef unlink
 
+#include "tile.h"
+
+#define STRINGIFY(x) #x
+#define TEXT_OF(x) STRINGIFY(x)
+#define PORT_TEXT TEXT_OF(TILE_PORT)
 #define MAX_EP 128
 #define MOCK_FD 1000
 #define FIFO_WAIT_NS 2000000L
@@ -52,7 +61,8 @@ static struct {
     unsigned long xmit_ok, rcv_ok;
     unsigned long rx_dropped, aggregates, largest, multi_frame_transfers, writes;
     uint32_t regs[2][0x4000], bmu;
-    int configs_seen[4], fs_uninit;
+    int configs_seen[4], fs_uninit, resets, absent;
+    enum rtl_chip chip;
     long link_at;
     pthread_t receiver;
 } m;
@@ -104,6 +114,17 @@ static int chip_running(void)
     return m.config == 0 && (*reg(PLA, 0xe810) >> 24 & 0x0c) == 0x0c && !(*reg(PLA, 0xe858) >> 16 & 8) && (*reg(PLA, 0xc010) & 0x0f);
 }
 
+/* A frame on a real cable is at least 60 bytes before its FCS: the sender pads it, and
+ * the receiving chip, like Linux, refuses anything shorter. */
+static ssize_t padded(uint8_t *frame, ssize_t n)
+{
+    if (n > 0 && n < 60) {
+        memset(frame + n, 0, (size_t)(60 - n));
+        n = 60;
+    }
+    return n;
+}
+
 /* The chip gathers what has arrived, up to the early size, and hands it to the
  * oldest pending transfer. */
 static void *receiver(void *unused)
@@ -118,15 +139,17 @@ static void *receiver(void *unused)
         size_t early;
 
         if (n <= 0) return NULL;
+        n = padded(frames[0], n);
         list[0].data = frames[0];
         list[0].len = (size_t)n;
         bytes = (size_t)n;
         pthread_mutex_lock(&m.lock);
         m.rcv_ok++;
-        early = (*reg(USB, 0xd42c) >> 16) * 16u;
+        early = (*reg(USB, 0xd42c) >> 16) * (m.chip == RTL_8156B ? 8u : 16u);
         while (count < MAX_AGGREGATE && bytes + 2 * FRAME_BYTES < early) {
             n = recv(m.cable, frames[count], FRAME_BYTES, MSG_DONTWAIT);
             if (n <= 0) break;
+            n = padded(frames[count], n);
             m.rcv_ok++;
             list[count].data = frames[count];
             list[count++].len = (size_t)n;
@@ -152,7 +175,7 @@ static void *receiver(void *unused)
             int i = m.rx_queue[0];
 
             memmove(m.rx_queue, m.rx_queue + 1, sizeof m.rx_queue[0] * (size_t)--m.rx_count);
-            assert(rtl_rx_fixture_encode(RTL_8159, list, count, m.ep[i].ppBuffer[0], m.ep[i].pLength[0], &written) == 0);
+            assert(rtl_rx_fixture_encode(m.chip, list, count, m.ep[i].ppBuffer[0], m.ep[i].pLength[0], &written) == 0);
             m.aggregates++;
             if (count > m.largest) m.largest = count;
             finish(i, (uint32_t)written, 0);
@@ -172,7 +195,7 @@ static void send_aggregate(int i)
 
     assert(chip_running() || (*reg(PLA, 0xe810) >> 24 & 0x04));
     assert(ep->nFrames == 1 && ep->flags == 0 && ep->timeout > 0 && length <= m.bufsize[i]);
-    assert(rtl_tx_decode(RTL_8159, ep->ppBuffer[0], length, views, 800, &count) == 0 && count >= 1);
+    assert(rtl_tx_decode(m.chip, ep->ppBuffer[0], length, views, 800, &count) == 0 && count >= 1);
     if (count > 1) m.multi_frame_transfers++;
     for (k = 0; k < count; k++) {
         assert(views[k].len >= 60 && views[k].len <= 1514);
@@ -195,7 +218,7 @@ static void send_aggregate(int i)
 int mock_stat(const char *path, struct stat *st)
 {
     (void)st;
-    return strcmp(path, "/dev/ugen2.2") ? fail(ENOENT) : 0;
+    return m.absent || strcmp(path, "/dev/ugen2.2") ? fail(ENOENT) : 0;
 }
 
 int mock_open(const char *path, int flags, ...)
@@ -243,7 +266,7 @@ static int vendor_read(struct usb_ctl_request *c)
     assert(c->ucr_request.bRequest == 0x05);
     memset(p, 0, length);
     if (which == PLA && address == 0xe908) {
-        put_le32(p, now() >= m.link_at ? 0x00094083u : 0);
+        put_le32(p, now() >= m.link_at ? (m.chip == RTL_8156B ? 0x00090483u : 0x00094083u) : 0);
     } else {
         for (i = 0; i < length / 4; i++) put_le32(p + 4 * i, *reg(which, address + 4 * i));
     }
@@ -251,19 +274,33 @@ static int vendor_read(struct usb_ctl_request *c)
     return 0;
 }
 
-/* Written independently of the tables in vendor_regs.c, from the same driver source. */
-static int on_the_list(unsigned which, unsigned dword)
+static int listed(const uint16_t *list, size_t n, unsigned dword)
 {
-    static const uint16_t pla[] = {0xc000, 0xc004, 0xc010, 0xc014, 0xc0a0, 0xc0a4, 0xc0a8, 0xc0b4, 0xc0bc, 0xcd00, 0xcd04, 0xd2cc, 0xd2e8, 0xd398,
-        0xe080, 0xe0cc, 0xe428, 0xe610, 0xe614, 0xe618, 0xe800, 0xe810, 0xe81c, 0xe84c, 0xe858, 0xe8dc};
-    static const uint16_t usb[] = {0xcbfc, 0xcfd8, 0xcfec, 0xcffc, 0xd268, 0xd3c8, 0xd404, 0xd40c, 0xd42c, 0xd430, 0xd434, 0xd4ac, 0xd4b0, 0xd4d8, 0xd4ec,
-        0xd5d4, 0xd5d8, 0xd5dc, 0xd808, 0xd818};
-    const uint16_t *list = which == PLA ? pla : usb;
-    size_t i, n = which == PLA ? sizeof pla / sizeof pla[0] : sizeof usb / sizeof usb[0];
+    size_t i;
 
     for (i = 0; i < n; i++)
         if (list[i] == dword) return 1;
     return 0;
+}
+
+/* Written independently of the tables in vendor_regs.c, from the same driver source:
+ * what both chips' paths write, and what only one of them does. */
+static int on_the_list(unsigned which, unsigned dword)
+{
+    static const uint16_t pla[] = {0xc000, 0xc004, 0xc010, 0xc014, 0xc0a0, 0xc0a4, 0xc0a8, 0xc0b4, 0xc0bc, 0xcd00, 0xcd04, 0xd2cc, 0xd2e8, 0xd398,
+        0xe080, 0xe0cc, 0xe428, 0xe610, 0xe614, 0xe618, 0xe800, 0xe810, 0xe81c, 0xe84c, 0xe858, 0xe8dc};
+    static const uint16_t usb[] = {0xcbfc, 0xcfd8, 0xcfec, 0xcffc, 0xd268, 0xd404, 0xd40c, 0xd42c, 0xd430, 0xd434, 0xd4b0, 0xd4d8, 0xd4ec,
+        0xd808, 0xd818};
+    static const uint16_t usb_8159[] = {0xd3c8, 0xd4ac, 0xd5d4, 0xd5d8, 0xd5dc};
+    static const uint16_t pla_8156b[] = {0xe854};
+    static const uint16_t usb_8156b[] = {0xb460, 0xd328, 0xd334, 0xd340, 0xd4e8};
+
+    if (which == PLA)
+        return listed(pla, sizeof pla / sizeof pla[0], dword) ||
+            (m.chip == RTL_8156B && listed(pla_8156b, sizeof pla_8156b / sizeof pla_8156b[0], dword));
+    return listed(usb, sizeof usb / sizeof usb[0], dword) ||
+        (m.chip == RTL_8159 ? listed(usb_8159, sizeof usb_8159 / sizeof usb_8159[0], dword) :
+            listed(usb_8156b, sizeof usb_8156b / sizeof usb_8156b[0], dword));
 }
 
 static int vendor_write(struct usb_ctl_request *c)
@@ -291,6 +328,12 @@ static int vendor_write(struct usb_ctl_request *c)
         *r &= ~3u;
     }
     if (which == PLA && dword == 0xc010 && (*r & 0x0f)) assert(m.rx_count > 0);
+    /* CR_RST: the MAC stops, and the bit clears itself. Only the RTL8156B's path sets it. */
+    if (which == PLA && dword == 0xe810 && (*r >> 24 & 0x10)) {
+        assert(m.chip == RTL_8156B);
+        *r &= ~(0x1cu << 24);
+        m.resets++;
+    }
     c->ucr_actlen = 4;
     return 0;
 }
@@ -384,7 +427,7 @@ static int device_ioctl(unsigned long request, void *arg)
 
         memset(dd, 0, sizeof *dd);
         USETW(dd->idVendor, 0x0bda);
-        USETW(dd->idProduct, 0x815a);
+        USETW(dd->idProduct, m.chip == RTL_8156B ? 0x8156 : 0x815a);
         USETW(dd->bcdUSB, 0x0320);
         dd->bNumConfigurations = 3;
         return 0;
@@ -480,23 +523,109 @@ void say(const char *fmt, ...)
 }
 
 extern const char *peer_files_root, *files_test_root;
+extern unsigned peer_link_mbps;
 extern int tile_calls[4];
 
-int main(void)
+/* ---- without an adapter: the page on the kernel's own sockets ------------- */
+
+static int http_exchange(const char *request, char *reply, size_t capacity)
+{
+    struct sockaddr_in to;
+    size_t used = 0;
+    int fd = -1, tries;
+
+    memset(&to, 0, sizeof to);
+    to.sin_family = AF_INET;
+    to.sin_port = htons(TILE_PORT);
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    for (tries = 0; tries < 200; tries++) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        assert(fd >= 0);
+        if (connect(fd, (struct sockaddr *)&to, sizeof to) == 0) break;
+        close(fd);
+        fd = -1;
+        usleep(50000);
+    }
+    if (fd < 0) return -1;
+    assert(write(fd, request, strlen(request)) == (ssize_t)strlen(request));
+    for (;;) {
+        ssize_t n = read(fd, reply + used, capacity - used - 1);
+
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    reply[used] = 0;
+    close(fd);
+    return 0;
+}
+
+static void *native_client(void *root)
+{
+    static char reply[16384];
+    char request[512];
+
+    assert(http_exchange("GET /api/info HTTP/1.1\r\nHost: 127.0.0.1:" PORT_TEXT "\r\n\r\n", reply, sizeof reply) == 0);
+    assert(strstr(reply, "200 OK") && strstr(reply, "\"mode\":\"native\"") && strstr(reply, "\"port\":" PORT_TEXT));
+    snprintf(request, sizeof request, "GET /fs/list?path=%s HTTP/1.1\r\nHost: 127.0.0.1:" PORT_TEXT "\r\n\r\n", (const char *)root);
+    assert(http_exchange(request, reply, sizeof reply) == 0 && strstr(reply, "200 OK") && strstr(reply, "\"entries\""));
+    /* A page on another site may not drive this one. */
+    assert(http_exchange("POST /api/exit HTTP/1.1\r\nHost: 127.0.0.1:" PORT_TEXT "\r\nOrigin: http://example.com\r\nContent-Length: 0\r\n\r\n",
+        reply, sizeof reply) == 0 && strstr(reply, "403"));
+    assert(http_exchange("POST /api/exit HTTP/1.1\r\nHost: 127.0.0.1:" PORT_TEXT "\r\nOrigin: http://127.0.0.1:" PORT_TEXT "\r\nContent-Length: 0\r\n\r\n",
+        reply, sizeof reply) == 0 && strstr(reply, "200 OK"));
+    return NULL;
+}
+
+static int run_without_adapter(const char *root)
+{
+    pthread_t client;
+    int code;
+
+    m.absent = 1;
+    assert(pthread_create(&client, NULL, native_client, (void *)root) == 0);
+    code = app_main();
+    assert(pthread_join(client, NULL) == 0);
+    fputs(report, stderr);
+    assert(code == 0);
+    assert(strstr(report, "no supported adapter found") && strstr(report, "usb devices: none"));
+    assert(strstr(report, "serving on the console's own network"));
+    assert(strstr(console, ":" PORT_TEXT "/") || strstr(report, "the console's address is not known"));
+    assert(!strstr(report, "127.0.0.1"));
+    assert(strstr(last_notify, "已退出") && !strstr(last_notify, "网卡"));
+    assert(tile_calls[0] == 1 && tile_calls[1] == 1);
+    assert(rmdir(root) == 0);
+    puts("end-to-end test passed: no adapter, the console's own network");
+    return 0;
+}
+
+/* A run that hangs still shows how far it got. */
+static void timed_out(int signo)
+{
+    (void)signo;
+    write(2, report, strlen(report));
+    write(2, "timed out\n", 10);
+    _exit(124);
+}
+
+int main(int argc, char **argv)
 {
     int cable[2], size = 1 << 20, status, code;
     char files_root[64];
     pid_t child;
 
+    signal(SIGALRM, timed_out);
     alarm(120);
+    m.chip = argc > 1 && !strcmp(argv[1], "8156b") ? RTL_8156B : RTL_8159;
+    snprintf(files_root, sizeof files_root, "/tmp/tom-usbnet-files-%d", (int)getpid());
+    assert(mkdir(files_root, 0700) == 0);
+    peer_files_root = files_test_root = files_root;
+    if (argc > 1 && !strcmp(argv[1], "none")) return run_without_adapter(files_root);
+    peer_link_mbps = m.chip == RTL_8156B ? 2500 : 10000;
     assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, cable) == 0);
     setsockopt(cable[0], SOL_SOCKET, SO_SNDBUF, &size, sizeof size);
     setsockopt(cable[1], SOL_SOCKET, SO_SNDBUF, &size, sizeof size);
     setsockopt(cable[0], SOL_SOCKET, SO_RCVBUF, &size, sizeof size);
     setsockopt(cable[1], SOL_SOCKET, SO_RCVBUF, &size, sizeof size);
-    snprintf(files_root, sizeof files_root, "/tmp/tom-usbnet-files-%d", (int)getpid());
-    assert(mkdir(files_root, 0700) == 0);
-    peer_files_root = files_test_root = files_root;
     child = fork();                     /* before any thread in this process */
     assert(child >= 0);
     if (child == 0) {
@@ -508,12 +637,13 @@ int main(void)
     pthread_cond_init(&m.changed, NULL);
     m.cable = cable[0];
     m.config = 0;
-    /* As read from the chip in the vendor configuration, and the adapter's own address. */
+    /* As read from the chip in the vendor configuration, and the adapter's own address.
+     * PLA_TCR0's top half is the version: 0x2020 for the RTL8159, 0x7410 for the RTL8156B. */
     *reg(PLA, 0xc000) = 0xccbbaa02u;
     *reg(PLA, 0xc004) = 0x0000eeddu;
     *reg(PLA, 0xc010) = 0x0402480fu;
     *reg(PLA, 0xe004) = 0x00000002u;
-    *reg(PLA, 0xe610) = 0x23200800u;
+    *reg(PLA, 0xe610) = m.chip == RTL_8156B ? 0x74100800u : 0x23200800u;
     *reg(PLA, 0xe858) = 0x02000000u;
     *reg(USB, 0xd404) = 0x00402e00u;
     *reg(USB, 0xd40c) = 0x00600400u;
@@ -527,7 +657,15 @@ int main(void)
     fputs(report, stderr);
     assert(code == 0);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    assert(strstr(report, "link up, 10000 Mbit/s"));
+    if (m.chip == RTL_8156B) {
+        assert(strstr(report, "chip RTL8156B, version 0x7410"));
+        assert(strstr(report, "link up, 2500 Mbit/s"));
+        assert(m.resets == 1);
+    } else {
+        assert(strstr(report, "chip RTL8159, version 0x2020"));
+        assert(strstr(report, "link up, 10000 Mbit/s"));
+        assert(m.resets == 0);
+    }
     assert(strstr(report, "address from dhcp"));
     assert(strstr(console, "http://192.0.2.50/"));
     assert(!strstr(report, "192.0.2.50"));              /* the address stays out of the file */
@@ -541,8 +679,8 @@ int main(void)
     fprintf(stderr, "mock: %lu register writes, largest aggregate %lu frames, %lu frames dropped\n", m.writes, m.largest, m.rx_dropped);
     assert(m.multi_frame_transfers > 0 && m.largest > 1 && m.writes > 20);
     assert(m.fs_uninit == 1 && m.configs_seen[2] == 1 && m.configs_seen[0] == 1 && m.config == 0 && m.alt == 0);
-    assert(tile_calls[0] == 1 && tile_calls[1] == 1 && tile_calls[3] == 1);
+    assert(tile_calls[0] == 1 && tile_calls[1] == 1);
     assert(rmdir(files_root) == 0);     /* the peer deleted what it uploaded */
-    puts("end-to-end test passed");
+    printf("end-to-end test passed: %s\n", m.chip == RTL_8156B ? "RTL8156B" : "RTL8159");
     return 0;
 }

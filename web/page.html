@@ -118,7 +118,7 @@ input[type=checkbox]{width:15px;height:15px;margin:0;accent-color:var(--accent);
 .modal.wide{max-width:600px}
 .modal h3{margin:0;padding:16px 18px 4px;font-size:16px}
 .modal .body{padding:8px 18px 12px;overflow-y:auto;color:var(--mut)}
-.modal .body input[type=text]{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--raised);color:var(--fg)}
+.modal .body input[type=text],.modal .body input[type=password]{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--raised);color:var(--fg)}
 .modal .foot{display:flex;justify-content:flex-end;gap:8px;padding:10px 18px 16px;flex-wrap:wrap}
 .names{margin:8px 0 0;padding:8px 10px;background:var(--raised);border-radius:8px;max-height:150px;overflow:auto;color:var(--fg);font-size:13px;word-break:break-all}
 .names div{padding:1px 0}
@@ -145,6 +145,12 @@ input[type=checkbox]{width:15px;height:15px;margin:0;accent-color:var(--accent);
 #disk-rows td:first-child,.bench th:first-child,#disk-rows td:last-child,.bench th:last-child{text-align:left}
 #net b{color:var(--accent);font-weight:700}
 #net .off-rate{color:var(--mut)}
+.form{display:grid;grid-template-columns:auto 1fr;gap:8px 10px;align-items:center;color:var(--fg)}
+.form label{color:var(--mut);font-size:13px;white-space:nowrap}
+.form .wide{grid-column:1/-1;color:var(--mut);font-size:12px}
+.form .check{grid-column:2;display:flex;gap:6px;align-items:center;color:var(--mut);font-size:13px}
+.via{font-size:12px;color:var(--mut)}
+#nas-add{flex:none;align-self:flex-start;justify-content:center}
 .ended{position:fixed;inset:0;z-index:60;background:var(--bg);display:none;align-items:center;justify-content:center;text-align:center;padding:24px}
 .ended.on{display:flex}
 .ended h2{margin:0 0 8px}
@@ -185,12 +191,13 @@ header{padding:10px 16px}
 <symbol id="moon" viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5z"/></symbol>
 <symbol id="power" viewBox="0 0 24 24"><path d="M12 4v8M7 7a7 7 0 1 0 10 0"/></symbol>
 <symbol id="info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></symbol>
+<symbol id="nas" viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="7" rx="1.5"/><rect x="4" y="14" width="16" height="7" rx="1.5"/><path d="M8 6.5h.01M8 17.5h.01M12 6.5h4M12 17.5h4"/></symbol>
 <symbol id="x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
 </defs></svg>
 
 <header>
 <div class="brand"><svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#142c5c"/><stop offset="1" stop-color="#088a96"/></linearGradient></defs><rect width="64" height="64" fill="url(#g)"/><path d="M10 22a4 4 0 0 1 4-4h16v8H10z" fill="#cdd8e4"/><rect x="10" y="22" width="44" height="29" rx="4" fill="#f4f7fa"/><path d="M38 22 27 36h6l-5 13 14-17h-7l5-10z" fill="#ffc42c"/></svg>tom-ps5-usbnet</div>
-<nav role="tablist"><button role="tab" id="tab-files" aria-selected="true">文件</button><button role="tab" id="tab-bench" aria-selected="false">硬盘测速</button></nav>
+<nav role="tablist"><button role="tab" id="tab-files" aria-selected="true">文件</button><button role="tab" id="tab-nas" aria-selected="false">NAS</button><button role="tab" id="tab-bench" aria-selected="false">硬盘测速</button></nav>
 <div class="chips">
 <span class="chip"><i class="dot" id="net-dot"></i><span id="net">正在连接…</span></span>
 <button class="chip" id="tile-chip" title="主机主屏幕上的图标"><svg class="i"><use href="#info"/></svg><span id="tile-text">图标</span></button>
@@ -230,6 +237,29 @@ header{padding:10px 16px}
 </div>
 </section>
 
+<section class="view" id="view-nas">
+<aside><h2>NAS</h2><div id="nas-servers" style="display:contents"></div><button class="primary" id="nas-add"><svg class="i"><use href="#plus"/></svg>添加 NAS</button></aside>
+<div class="workspace">
+<div class="toolbar">
+<button class="primary" id="nas-copy" disabled><svg class="i"><use href="#down"/></svg>复制到主机</button>
+<button id="nas-edit" disabled><svg class="i"><use href="#edit"/></svg>修改服务器</button>
+<button id="nas-forget" class="danger" disabled><svg class="i"><use href="#trash"/></svg>删除服务器</button>
+<span class="gap"></span>
+<button class="quiet" id="nas-refresh" title="刷新" aria-label="刷新"><svg class="i"><use href="#refresh"/></svg></button>
+</div>
+<div class="crumbs" id="nas-crumbs"></div>
+<div class="list" id="nas-list" tabindex="0">
+<table><thead><tr><th class="c-check"><div style="padding:0 10px"><input type="checkbox" id="nas-all" aria-label="全选"></div></th>
+<th><div style="padding:8px 10px">名称</div></th>
+<th class="c-size r"><div style="padding:8px 10px">大小</div></th>
+<th class="c-time r"><div style="padding:8px 10px">修改时间</div></th></tr></thead>
+<tbody id="nas-items"></tbody></table>
+<div class="empty" id="nas-empty" hidden></div>
+</div>
+<div class="status"><span id="nas-count"></span><span class="via" id="nas-via"></span></div>
+</div>
+</section>
+
 <section class="view" id="view-bench">
 <div class="bench">
 <div class="card">
@@ -256,7 +286,7 @@ header{padding:10px 16px}
 <div class="menu" id="menu"></div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <div class="back" id="back"><div class="modal" id="modal" role="dialog" aria-modal="true"><h3 id="m-title"></h3><div class="body" id="m-body"></div><div class="foot" id="m-foot"></div></div></div>
-<div class="ended" id="ended"><div><h2>已退出</h2><p>网卡已恢复，服务已关闭。再次使用前请拔插一次网卡。</p></div></div>
+<div class="ended" id="ended"><div><h2>已退出</h2><p id="ended-text">网卡已恢复，服务已关闭。再次使用前请拔插一次网卡。</p></div></div>
 <input type="file" id="pick-files" multiple hidden>
 <input type="file" id="pick-folder" webkitdirectory hidden>
 
@@ -265,7 +295,7 @@ header{padding:10px 16px}
 const $=id=>document.getElementById(id);
 const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n};
 const icon=(name,cls)=>{const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('class','i'+(cls?' '+cls:''));const u=document.createElementNS('http://www.w3.org/2000/svg','use');u.setAttribute('href','#'+name);s.appendChild(u);return s};
-const ERRORS={not_found:'找不到这个文件或文件夹',exists:'同名项目已经存在',not_empty:'文件夹不是空的',no_space:'目标硬盘空间不够',denied:'主机拒绝了这个操作',read_only:'这个位置是只读的',other_volume:'不能跨硬盘改名',name_too_long:'名字太长',is_folder:'这是文件夹',not_folder:'这不是文件夹',busy:'正在被占用',failed:'操作失败',bad_path:'这个路径不允许操作',into_itself:'不能放进它自己里面',job_running:'已有一个复制或移动在进行',no_memory:'主机内存不足',no_thread:'主机无法启动任务',source_kept:'已复制到新位置，但删除原文件失败',length_required:'缺少长度',bad_range:'范围无效'};
+const ERRORS={not_found:'找不到这个文件或文件夹',exists:'同名项目已经存在',not_empty:'文件夹不是空的',no_space:'目标硬盘空间不够',denied:'主机拒绝了这个操作',read_only:'这个位置是只读的',other_volume:'不能跨硬盘改名',name_too_long:'名字太长',is_folder:'这是文件夹',not_folder:'这不是文件夹',busy:'正在被占用',failed:'操作失败',bad_path:'这个路径不允许操作',into_itself:'不能放进它自己里面',job_running:'已有一个复制或移动在进行',no_memory:'主机内存不足',no_thread:'主机无法启动任务',source_kept:'已复制到新位置，但删除原文件失败',length_required:'缺少长度',bad_range:'范围无效',unreachable:'连不上这台 NAS',auth:'用户名或密码不对',no_share:'NAS 上没有这个共享',timeout:'NAS 没有响应',dropped:'和 NAS 的连接断了',too_many:'最多保存 16 台 NAS',not_saved:'无法保存到主机',bad_request:'填写的内容有误',nas_denied:'NAS 拒绝了访问'};
 const say_error=code=>ERRORS[code]||code||'操作失败';
 const S={volumes:[],path:'',entries:[],selected:new Set(),anchor:null,sort:{key:'name',dir:1},filter:'',busy:false};
 const fmtSize=n=>{if(n<1024)return n+' B';const u=['KB','MB','GB','TB'];let i=-1;do{n/=1024;i++}while(n>=1024&&i<3);return n.toFixed(n<10?2:n<100?1:0)+' '+u[i]};
@@ -277,7 +307,7 @@ const parent=p=>p.slice(0,p.lastIndexOf('/'));
 const baseName=p=>p.slice(p.lastIndexOf('/')+1);
 const q=p=>encodeURIComponent(p);
 function withTimeout(ms){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return{signal:c.signal,done:()=>clearTimeout(t)}}
-async function api(url,post,ms){const w=withTimeout(ms||30000);try{const r=await fetch(url,{method:post?'POST':'GET',signal:w.signal});let j={};try{j=await r.json()}catch(e){if(!r.ok)j={error:'failed'}}if(!r.ok||j.error){const err=new Error(say_error(j.error));err.code=j.error;throw err}return j}finally{w.done()}}
+async function api(url,post,ms,form){const w=withTimeout(ms||30000);try{const init={method:post?'POST':'GET',signal:w.signal};if(form){init.body=Object.keys(form).map(k=>k+'='+encodeURIComponent(form[k])).join('&');init.headers={'Content-Type':'application/x-www-form-urlencoded'}}const r=await fetch(url,init);let j={};try{j=await r.json()}catch(e){if(!r.ok)j={error:'failed'}}if(!r.ok||j.error){const err=new Error(say_error(j.error));err.code=j.error;throw err}return j}finally{w.done()}}
 function toast(text,bad){const t=el('div','toast'+(bad?' bad':''),text);$('toasts').append(t);setTimeout(()=>t.remove(),bad?7000:3500)}
 const fail=e=>toast(e.name==='AbortError'?'主机没有响应':e.message,true);
 
@@ -320,7 +350,7 @@ function menuAt(x,y){const m=$('menu');m.textContent='';const n=S.selected.size,
 const hideMenu=()=>$('menu').classList.remove('on');
 
 /* ---- transfers: one at a time, so that each speed is that file's ---- */
-const VERB={upload:'上传：',download:'下载：',copy:'复制：',move:'移动：'};
+const VERB={upload:'上传：',download:'下载：',copy:'复制：',move:'移动：',smb:'NAS：'};
 const CLIENT=Math.random().toString(36).slice(2,12)||'page';
 const T={tasks:[],running:false,cancel:null,samples:[],last:0,lastAt:0,hist:[],batchBytes:0,batchMs:0,timer:null,seq:0};
 function addTask(kind,name,size,run,state){const t={id:++T.seq,kind,name,size,run,done:0,state:state||'wait',node:null};T.tasks.push(t);drawTask(t);$('dock').classList.add('on');pump();return t}
@@ -342,7 +372,27 @@ async function startUpload(found){const dest=S.path;if(!dest||!found.files.lengt
 async function fromDrop(items){const out={files:[],dirs:[]},entries=[];for(let i=0;i<items.length;i++){const it=items[i];if(it.kind!=='file')continue;const e=it.webkitGetAsEntry&&it.webkitGetAsEntry();if(e)entries.push(e);else{const f=it.getAsFile();if(f)out.files.push({file:f,rel:f.name})}}for(const e of entries)await walk(e,'',out);startUpload(out)}
 function fromPicker(input){const out={files:[],dirs:[]},dirs=new Set();Array.from(input.files).forEach(f=>{const rel=f.webkitRelativePath||f.name;out.files.push({file:f,rel});const parts=rel.split('/');for(let i=1;i<parts.length;i++)dirs.add(parts.slice(0,i).join('/'))});out.dirs=Array.from(dirs);input.value='';startUpload(out)}
 async function transfer(move){const list=selected();if(!list.length)return;const dest=await pickFolder((move?'移动 ':'复制 ')+list.length+' 项到',move?'移动到这里':'复制到这里',S.path);if(!dest)return;if(dest===S.path)return toast('目标就是当前文件夹',true);list.forEach(e=>{const from=join(S.path,e.name),to=join(dest,e.name);addTask(move?'move':'copy',VERB[move?'move':'copy']+e.name,e.kind==='folder'?0:e.size,t=>runJob(t,from,to,move))})}
-async function runJob(t,from,to,move){const r=await api('/fs/'+(move?'move':'copy')+'?from='+q(from)+'&to='+q(to)+'&client='+CLIENT,true);if(r.instant){t.done=t.size;t.note='已完成（同一硬盘）';return}let stop=false;T.cancel=()=>{stop=true;api('/fs/cancel',true).catch(()=>{})};for(;;){await new Promise(res=>setTimeout(res,400));const j=await api('/fs/job');if(j.total)t.size=j.total;t.done=j.done;if(j.state==='done'){t.rate=mbs(j.done,j.ms);return}if(j.state==='canceled'){const e=new Error('canceled');e.code='canceled';throw e}if(j.state==='failed')throw new Error(say_error(j.error));if(stop&&j.state==='idle')return}}
+async function runJob(t,from,to,move){const r=await api('/fs/'+(move?'move':'copy')+'?from='+q(from)+'&to='+q(to)+'&client='+CLIENT,true);if(r.instant){t.done=t.size;t.note='已完成（同一硬盘）';return}return watchJob(t)}
+async function watchJob(t){let stop=false;T.cancel=()=>{stop=true;api('/fs/cancel',true).catch(()=>{})};for(;;){await new Promise(res=>setTimeout(res,400));const j=await api('/fs/job');if(j.total)t.size=j.total;t.done=j.done;if(j.state==='done'){t.rate=mbs(j.done,j.ms);return}if(j.state==='canceled'){const e=new Error('canceled');e.code='canceled';throw e}if(j.state==='failed')throw new Error(say_error(j.error));if(stop&&j.state==='idle')return}}
+
+/* ---- NAS: browse a share and copy from it to the console ---- */
+const N={loaded:false,servers:[],id:0,share:'',path:'',entries:[],selected:new Set(),busy:false,over:'',error:''};
+const nasServer=()=>N.servers.find(x=>x.id===N.id);
+const nasJoin=(a,b)=>a?a+'/'+b:b;
+async function nasLoad(open){N.loaded=true;try{const j=await api('/smb/servers');N.servers=j.servers;if(open)N.id=open;if(N.id&&!nasServer())N.id=0;nasServers();if(!N.id&&N.servers.length)N.id=N.servers[0].id;if(N.id)await nasOpen(N.id,open?'':N.share,open?'':N.path);else nasDraw()}catch(e){N.loaded=false;fail(e)}}
+function nasServers(){const box=$('nas-servers');box.textContent='';N.servers.forEach(v=>{const b=el('button','vol'+(v.id===N.id?' on':''));const top=el('div','vol-top');top.append(icon('nas'),document.createTextNode(v.name));const sub=el('div','vol-sub');sub.append(el('span','mono',v.host+(v.port!==445?':'+v.port:'')));b.append(top,sub,el('div','vol-foot',v.user?'用户 '+v.user:'来宾登录'));b.onclick=()=>nasOpen(v.id,'','');box.append(b)})}
+async function nasOpen(id,share,path){if(N.busy)return;N.busy=true;N.id=id;N.share=share;N.path=path;N.selected=new Set();N.entries=[];N.error='';N.over='';nasServers();$('nas-count').textContent='正在连接 NAS…';$('nas-items').textContent='';$('nas-empty').hidden=true;nasButtons();try{if(!share){const j=await api('/smb/shares?id='+id,false,60000);N.entries=j.shares.map(x=>({name:x.name,dir:true,share:true,remark:x.remark}))}else{const j=await api('/smb/list?id='+id+'&share='+q(share)+'&path='+q(path),false,60000);N.entries=j.entries;N.over=j.over;N.truncated=j.truncated}}catch(e){N.error=e.name==='AbortError'?'NAS 没有响应':e.message}finally{N.busy=false}nasDraw()}
+function nasCrumbs(){const box=$('nas-crumbs'),v=nasServer();box.textContent='';if(!v)return;const add=(label,share,path)=>{const b=el('button','',label);b.onclick=()=>nasOpen(N.id,share,path);box.append(b)};add(v.name,'','');if(!N.share)return;box.append(el('span','','/'));add(N.share,N.share,'');let at='';N.path.split('/').filter(Boolean).forEach(part=>{at=nasJoin(at,part);box.append(el('span','','/'));add(part,N.share,at)})}
+function nasDraw(){nasCrumbs();const body=$('nas-items');body.textContent='';const list=N.entries.slice().sort((a,b)=>a.dir!==b.dir?(a.dir?-1:1):a.name.localeCompare(b.name,'zh',{numeric:true}));list.forEach(e=>{const tr=el('tr');tr.dataset.name=e.name;const check=el('td'),box=el('input');box.type='checkbox';box.tabIndex=-1;box.disabled=!!e.share;box.setAttribute('aria-label','选择 '+e.name);check.append(box);const cell=el('td'),nm=el('div','nm');cell.append(nm);nm.append(icon(e.share?'nas':e.dir?'folder':'file',e.dir&&!e.share?'folder':''));const open=()=>nasOpen(N.id,e.share?e.name:N.share,e.share?'':nasJoin(N.path,e.name));if(e.dir){const a=el('a','',e.name);a.href='#';a.onclick=ev=>{ev.preventDefault();ev.stopPropagation();open()};nm.append(a)}else{nm.append(el('span','',e.name));nm.title=e.name}tr.append(check,cell,el('td','r num mut',e.dir?'—':fmtSize(e.size)),el('td','r num mut c-time',e.share?(e.remark||''):fmtTime(e.mtime)));tr.onclick=()=>{if(e.share)return open();if(N.selected.has(e.name))N.selected.delete(e.name);else N.selected.add(e.name);nasPaint()};tr.ondblclick=()=>{if(e.dir&&!e.share)open()};body.append(tr)});const empty=$('nas-empty');empty.hidden=list.length>0;if(!list.length){empty.textContent='';empty.append(icon(N.error?'info':'nas'),el('div','',N.error||(!N.servers.length?'还没有添加 NAS，点“添加 NAS”填写地址和账号。':!N.share?'这台 NAS 没有可用的共享':'空文件夹')))}nasPaint()}
+function nasPaint(){document.querySelectorAll('#nas-items tr').forEach(tr=>{const on=N.selected.has(tr.dataset.name);tr.classList.toggle('on',on);tr.firstChild.firstChild.checked=on});const n=N.selected.size,pick=N.entries.filter(e=>N.selected.has(e.name)),size=(n?pick:N.entries).reduce((s,e)=>s+(e.dir?0:e.size),0);const all=$('nas-all'),selectable=N.share?N.entries.length:0;all.disabled=!selectable;all.checked=n>0&&n===selectable;all.indeterminate=n>0&&n<selectable;$('nas-count').textContent=N.error?'':!N.share?(N.id?N.entries.length+' 个共享':''):(n?'已选 '+n+' 项，':N.entries.length+' 项，')+fmtSize(size)+(N.truncated?'（只显示前 5000 项）':'');$('nas-via').textContent=N.over==='usb'?'经由 USB 网卡':N.over==='console'?'经由主机网络':'';nasButtons()}
+function nasButtons(){$('nas-copy').disabled=!N.share||!N.selected.size||N.busy;$('nas-edit').disabled=$('nas-forget').disabled=!N.id}
+function nasForm(v){return modal(v?'修改 NAS':'添加 NAS',body=>{const f=el('div','form');const field=(label,type,value,hint,max)=>{const i=el('input');i.type=type;i.value=value||'';i.placeholder=hint||'';i.maxLength=max;i.spellcheck=false;i.autocomplete=type==='password'?'new-password':'off';i.setAttribute('aria-label',label);i.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('m-foot').querySelector('.primary').click()}});f.append(el('label','',label),i);return i};const host=field('地址','text',v&&v.host,'IP 或主机名，如 192.168.1.20',63),user=field('用户名','text',v&&v.user,'留空用来宾登录',63),pass=field('密码','password','',v&&v.password?'已保存，留空不修改':'',127),port=field('端口','text',v&&v.port!==445?String(v.port):'','445',5),domain=field('域','text',v&&v.domain,'一般留空',63),name=field('显示名称','text',v&&v.name!==v.host?v.name:'','留空就用地址',63);let clear=null;if(v&&v.password){const c=el('label','check');clear=el('input');clear.type='checkbox';c.append(clear,document.createTextNode('清除已保存的密码'));f.append(c)}f.append(el('div','wide','密码只保存在主机上，页面不会再显示。插入 USB 网卡时优先经网卡连接 NAS。'));body.append(f);return{value:()=>{const o={host:host.value.trim(),port:port.value.trim()||'445',user:user.value.trim(),domain:domain.value.trim(),name:name.value.trim()};if(!v||pass.value)o.password=pass.value;if(clear&&clear.checked)o.password='';if(v)o.id=v.id;return o}}},[CANCEL,{text:'保存',cls:'primary'}])}
+async function nasSave(v){const o=await nasForm(v);if(!o)return;if(!/^[A-Za-z0-9._-]+$/.test(o.host))return toast('地址只能是 IP 或主机名',true);if(!/^\d+$/.test(o.port)||+o.port<1||+o.port>65535)return toast('端口不对',true);try{const j=await api('/smb/save',true,30000,o);await nasLoad(j.id)}catch(e){fail(e)}}
+async function nasForget(){const v=nasServer();if(!v)return;const ok=await modal('删除 '+v.name+'？',body=>body.append(el('div','','只删除保存的地址和账号，NAS 上的文件不受影响。')),[CANCEL,{text:'删除',cls:'primary',value:true}]);if(!ok)return;try{await api('/smb/forget?id='+v.id,true);N.id=0;N.share='';N.path='';await nasLoad()}catch(e){fail(e)}}
+async function nasCopy(){const list=N.entries.filter(e=>N.selected.has(e.name));if(!list.length)return;if(!S.volumes.length)await loadVolumes().catch(()=>{});const dest=await pickFolder('复制 '+list.length+' 项到主机','复制到这里',S.path);if(!dest)return;const id=N.id,share=N.share;list.forEach(e=>{const path=nasJoin(N.path,e.name),to=join(dest,e.name);addTask('smb',VERB.smb+e.name,e.dir?0:e.size,t=>runSmb(t,id,share,path,to))})}
+async function runSmb(t,id,share,path,to){await api('/smb/copy?id='+id+'&share='+q(share)+'&path='+q(path)+'&to='+q(to)+'&client='+CLIENT,true);return watchJob(t)}
+$('nas-add').onclick=()=>nasSave(null);$('nas-edit').onclick=()=>nasSave(nasServer());$('nas-forget').onclick=nasForget;$('nas-copy').onclick=nasCopy;$('nas-refresh').onclick=()=>N.id?nasOpen(N.id,N.share,N.path):nasLoad();
+$('nas-all').onclick=e=>{N.selected=new Set(e.target.checked&&N.share?N.entries.map(x=>x.name):[]);nasPaint()};
 
 /* ---- wiring ---- */
 $('up-files').onclick=()=>$('pick-files').click();$('up-folder').onclick=()=>$('pick-folder').click();$('pick-files').onchange=e=>fromPicker(e.target);$('pick-folder').onchange=e=>fromPicker(e.target);
@@ -356,12 +406,12 @@ let dragDepth=0;const hasFiles=e=>e.dataTransfer&&Array.from(e.dataTransfer.type
 addEventListener('dragenter',e=>{if(!hasFiles(e))return;e.preventDefault();dragDepth++;$('drop-path').textContent=S.path;$('drop').classList.add('on')});
 addEventListener('dragover',e=>{if(hasFiles(e)){e.preventDefault();e.dataTransfer.dropEffect='copy'}});
 addEventListener('dragleave',e=>{if(hasFiles(e)&&--dragDepth<=0){dragDepth=0;$('drop').classList.remove('on')}});
-addEventListener('drop',e=>{if(!hasFiles(e))return;e.preventDefault();dragDepth=0;$('drop').classList.remove('on');if($('tab-bench').getAttribute('aria-selected')==='true')showTab('files');fromDrop(e.dataTransfer.items)});
+addEventListener('drop',e=>{if(!hasFiles(e))return;e.preventDefault();dragDepth=0;$('drop').classList.remove('on');if(!$('view-files').classList.contains('on'))showTab('files');fromDrop(e.dataTransfer.items)});
 addEventListener('click',e=>{if(!e.target.closest('#menu'))hideMenu()});
 addEventListener('beforeunload',e=>{if(T.running){e.preventDefault();e.returnValue=''}});
-addEventListener('keydown',e=>{if(e.key==='Escape'){hideMenu();if(closeModal)closeModal();return}const typing=/^(INPUT|TEXTAREA)$/.test(e.target.tagName);if(typing||closeModal)return;if(e.key==='Delete')removeSelected();else if(e.key==='F2')renameOne();else if((e.ctrlKey||e.metaKey)&&e.key==='a'&&$('view-files').classList.contains('on')){e.preventDefault();S.selected=new Set(S.shown.map(x=>x.name));paint()}else if(e.key==='Backspace'&&volOf(S.path)&&volOf(S.path).path!==S.path){e.preventDefault();go(parent(S.path))}});
-function showTab(name){['files','bench'].forEach(n=>{$('tab-'+n).setAttribute('aria-selected',n===name);$('view-'+n).classList.toggle('on',n===name)})}
-$('tab-files').onclick=()=>showTab('files');$('tab-bench').onclick=()=>showTab('bench');
+addEventListener('keydown',e=>{if(e.key==='Escape'){hideMenu();if(closeModal)closeModal();return}const typing=/^(INPUT|TEXTAREA)$/.test(e.target.tagName);if(typing||closeModal||!$('view-files').classList.contains('on'))return;if(e.key==='Delete')removeSelected();else if(e.key==='F2')renameOne();else if((e.ctrlKey||e.metaKey)&&e.key==='a'&&$('view-files').classList.contains('on')){e.preventDefault();S.selected=new Set(S.shown.map(x=>x.name));paint()}else if(e.key==='Backspace'&&volOf(S.path)&&volOf(S.path).path!==S.path){e.preventDefault();go(parent(S.path))}});
+function showTab(name){if(name==='nas'&&!N.loaded)nasLoad();['files','nas','bench'].forEach(n=>{$('tab-'+n).setAttribute('aria-selected',n===name);$('view-'+n).classList.toggle('on',n===name)})}
+$('tab-files').onclick=()=>showTab('files');$('tab-nas').onclick=()=>showTab('nas');$('tab-bench').onclick=()=>showTab('bench');
 function setTheme(t){document.documentElement.dataset.theme=t;try{localStorage.setItem('theme',t)}catch(e){}}
 try{const t=localStorage.getItem('theme');if(t)document.documentElement.dataset.theme=t}catch(e){}
 $('theme').onclick=()=>{const cur=document.documentElement.dataset.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');setTheme(cur==='dark'?'light':'dark')};
@@ -377,7 +427,7 @@ function showRate(shown){$('rate').textContent=shown>=100?shown.toFixed(0):shown
 function remote(list){const now=performance.now(),live=new Set();let moved=0,active=0,again=false;for(const x of list){live.add(x.id);if(x.client===CLIENT)continue;let t=R.tasks.get(x.id);if(!t){if(R.seen.has(x.id))continue;R.seen.add(x.id);if(x.state!=='active'){again=!R.first;continue}t={id:'r'+x.id,kind:x.kind==='upload'?'up':x.kind,name:(VERB[x.kind]||'')+x.name,size:x.size,done:x.done,state:'run',remote:true,node:null};T.tasks.push(t);R.tasks.set(x.id,t);$('dock').classList.add('on')}moved+=Math.max(0,x.done-t.done);t.size=x.size;t.done=x.done;t.rate=mbs(x.done,x.ms);if(x.state==='active'){active++;t.state=x.kind==='upload'&&x.size&&x.done>=x.size?'sync':'run'}else{if(!t.size)t.size=t.done;t.state=x.state==='done'?'done':'fail';if(t.state==='fail')t.note='已中断';R.tasks.delete(x.id);again=true}drawTask(t)}for(const[id,t]of R.tasks)if(!live.has(id)){t.state='fail';t.note='已中断';drawTask(t);R.tasks.delete(id);again=true}const dt=now-R.at;R.at=now;if(!T.running){if(active){T.samples.push(dt>0?moved/dt/1000:0);if(T.samples.length>120)T.samples.shift();const recent=T.samples.slice(-3);showRate(recent.reduce((a,b)=>a+b,0)/recent.length);$('st-now').textContent=active+' 个传输进行中';$('dock-close').hidden=true;totals();draw()}else if(R.active){showRate(0);$('st-now').textContent='已完成';$('dock-close').hidden=false;totals();draw()}}R.active=active>0;R.first=false;if(again&&!T.running)refresh()}
 async function poll(){if(document.hidden||R.busy||$('ended').classList.contains('on'))return;R.busy=true;try{const j=await api('/fs/transfers',false,5000);remote(j.transfers);if(R.fails>=3||++R.tick%10===0)loadInfo();R.fails=0}catch(e){if(++R.fails===3){$('net').textContent='已断开';$('net-dot').classList.remove('on');$('net-dot').classList.add('off')}}R.busy=false}
 
-async function end(){const ok=await modal('退出？',body=>{body.append(el('div','','恢复网卡并关闭端口，进行中的传输会中断。'))},[CANCEL,{text:'退出',cls:'primary',value:true}]);if(!ok)return;try{await fetch('/api/exit',{method:'POST'})}catch(e){}$('ended').classList.add('on')}
+async function end(){const ok=await modal('退出？',body=>{body.append(el('div','',S.native?'关闭端口，进行中的传输会中断。':'恢复网卡并关闭端口，进行中的传输会中断。'))},[CANCEL,{text:'退出',cls:'primary',value:true}]);if(!ok)return;try{await fetch('/api/exit',{method:'POST'})}catch(e){}if(S.native)$('ended-text').textContent='服务已关闭。要再用，请重新运行插件。';$('ended').classList.add('on')}
 $('end').onclick=end;
 
 /* ---- the icon ---- */
@@ -387,7 +437,7 @@ $('tile-chip').onclick=async()=>{await tile();const on=S.tile&&S.tile.state==='i
 
 /* ---- start ---- */
 const RATES=[[1000,'1G'],[2500,'2.5G'],[5000,'5G'],[10000,'10Gbps']];
-function loadInfo(){return fetch('/api/info').then(r=>r.json()).then(j=>{const n=$('net');n.textContent=j.ip+' · ';RATES.forEach(([m,label],i)=>{if(i)n.append('/');n.append(m===j.link_mbps?el('b','',label):el('span','off-rate',label))});if(j.link_mbps&&j.link_mbps<1000)n.append(' · ',el('b','',j.link_mbps+'M'));n.append(' · v'+j.version);$('net-dot').classList.remove('off');$('net-dot').classList.add('on')}).catch(()=>{$('net').textContent='连接失败';$('net-dot').classList.remove('on');$('net-dot').classList.add('off')})}
+function loadInfo(){return fetch('/api/info').then(r=>r.json()).then(j=>{const n=$('net');S.native=j.mode==='native';if(S.native){n.textContent=j.ip+':'+j.port+' · 主机网络 · v'+j.version}else{n.textContent=j.ip+' · ';RATES.filter(([m])=>!j.max_mbps||m<=j.max_mbps).forEach(([m,label],i)=>{if(i)n.append('/');n.append(m===j.link_mbps?el('b','',label):el('span','off-rate',label))});if(j.link_mbps&&j.link_mbps<1000)n.append(' · ',el('b','',j.link_mbps+'M'));n.append(' · v'+j.version)}$('net-dot').classList.remove('off');$('net-dot').classList.add('on')}).catch(()=>{$('net').textContent='连接失败';$('net-dot').classList.remove('on');$('net-dot').classList.add('off')})}
 loadInfo();
 (async()=>{try{await loadVolumes();const h=decodeURI(location.hash.slice(1));const start=h&&volOf(h)?h:S.volumes[0]&&S.volumes[0].path;if(start)await go(start);else $('count').textContent='没有找到存储位置'}catch(e){fail(e)}tile();poll();setInterval(poll,1000)})();
 </script>

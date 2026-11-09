@@ -1027,6 +1027,95 @@ static void job_finish(const char *state, const char *error_code)
     pthread_mutex_unlock(&g_job.lock);
 }
 
+/* ---- a job that runs elsewhere: smb.c's copies from a share --------------- */
+
+int files_job_run(struct http_stream *stream, const char *kind, const char *label, const char *to, const char *client, void *(*body)(void *), void *arg,
+    int *started)
+{
+    struct stat st;
+    char parent[MAX_PATH_BYTES], *slash;
+    pthread_attr_t attr;
+    pthread_t thread;
+    int result;
+
+    *started = 0;
+    if (!usable(to) || is_volume(to)) return error(stream, 400, "bad_path");
+    if (lstat(to, &st) == 0) return error(stream, 409, "exists");
+    snprintf(parent, sizeof parent, "%s", to);
+    slash = strrchr(parent, '/');
+    if (slash) *slash = 0;
+    if (lstat(parent, &st) != 0) return fail(stream);
+    if (!S_ISDIR(st.st_mode)) return error(stream, 409, "not_folder");
+    pthread_mutex_lock(&g_job.lock);
+    if (g_job.running) {
+        pthread_mutex_unlock(&g_job.lock);
+        return error(stream, 409, "job_running");
+    }
+    g_job.running = 1;
+    g_job.cancel = 0;
+    g_job.move = 0;
+    g_job.kind = kind;
+    g_job.state = "running";
+    g_job.error[0] = 0;
+    g_job.done = 0;
+    g_job.total = 0;
+    g_job.started = now_ms();
+    g_job.ended = 0;
+    snprintf(g_job.from, sizeof g_job.from, "%s", label);
+    snprintf(g_job.to, sizeof g_job.to, "%s", to);
+    snprintf(g_job_client, sizeof g_job_client, "%s", client);
+    pthread_mutex_unlock(&g_job.lock);
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, JOB_STACK);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    result = pthread_create(&thread, &attr, body, arg);
+    pthread_attr_destroy(&attr);
+    if (result) {
+        job_finish("failed", "no_thread");
+        return error(stream, 503, "no_thread");
+    }
+    *started = 1;
+    return reply(stream, 200, "{}");
+}
+
+int files_job_size(uint64_t bytes)
+{
+    char parent[MAX_PATH_BYTES], *slash;
+
+    pthread_mutex_lock(&g_job.lock);
+    g_job.total = bytes;
+    pthread_mutex_unlock(&g_job.lock);
+    snprintf(parent, sizeof parent, "%s", g_job.to);
+    slash = strrchr(parent, '/');
+    if (slash) *slash = 0;
+    if (bytes > free_bytes(parent)) return -1;
+    g_job_transfer = transfer_begin(g_job.kind, g_job.from, g_job_client, bytes);
+    return 0;
+}
+
+void files_job_add(uint64_t bytes)
+{
+    job_add(bytes);
+}
+
+int files_job_canceled(void)
+{
+    return __atomic_load_n(&g_job.cancel, __ATOMIC_RELAXED);
+}
+
+void files_job_end(const char *error_code)
+{
+    if (!error_code || !error_code[0]) {
+        note_transfer(g_job.kind, g_job.to, g_job.done, now_ms() - g_job.started, 0);
+        job_finish("done", "");
+        return;
+    }
+    /* The target did not exist when the job began, so all of it is this job's. */
+    remove_tree(g_job.to, 0, NULL);
+    if (!strcmp(error_code, "canceled")) job_finish("canceled", "");
+    else job_finish("failed", error_code);
+}
+
 static void *job_thread(void *unused)
 {
     uint8_t *buffer = malloc(IO_BYTES);

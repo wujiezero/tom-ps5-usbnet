@@ -158,7 +158,8 @@ int rtl_identify_target(const struct rtl_usb_device *d,uint16_t ver,
     if (!d || !out) return RTL_EINVAL;
     ver&=0x7cf0u;
     if (d->vid!=0x0bda) return RTL_EUNSUPPORTED;
-    if (d->pid==0x8156 && (ver==0x7400 || ver==0x7410)) *out=RTL_8156B;
+    /* RTL_VER_12, 13 and 15 in Linux's r8152; 0x7020/0x7030, the first RTL8156, are not. */
+    if (d->pid==0x8156 && (ver==0x7400 || ver==0x7410 || ver==0x7420)) *out=RTL_8156B;
     else if (d->pid==0x815a && ver==0x2020) *out=RTL_8159;
     else return RTL_EUNSUPPORTED;
     return 0;
@@ -224,35 +225,41 @@ int rtl_write_request(struct rtl_write *out,unsigned mcu,unsigned address,unsign
     put32(out->data,value<<(shift*8u));
     return 0;
 }
-int rtl_8159_tx_header(uint8_t h[RTL_8159_HEADER],size_t len)
+int rtl_tx_header(enum rtl_chip chip,uint8_t *h,size_t len)
 {
-    if (!h || len<60 || len>RTL_MAX_FRAME) return RTL_EINVAL;
+    struct rtl_format f;
+    if (!h || len<60 || len>RTL_MAX_FRAME || rtl_get_format(chip,&f)) return RTL_EINVAL;
     put32(h,0xc0000000u|(uint32_t)len);
     put32(h+4,0);
-    put32(h+8,(uint32_t)len<<4);
-    put32(h+12,0xa8000000u);
-    return 0;
+    if (chip==RTL_8159) {
+        put32(h+8,(uint32_t)len<<4);
+        put32(h+12,0xa8000000u);
+    }
+    return (int)f.tx_header;
 }
-int rtl_8159_rx_scan(const uint8_t *d,size_t len,struct rtl_frame_view *views,size_t cap,size_t *count)
+/* Linux's rx_bottom: a length below ETH_ZLEN ends the walk, as it does there. */
+int rtl_rx_scan(enum rtl_chip chip,const uint8_t *d,size_t len,struct rtl_frame_view *views,size_t cap,size_t *count)
 {
-    size_t off=0,n=0,j; uint32_t w; size_t wire;
+    struct rtl_format f;
+    size_t off=0,n=0,j,wire,h,a,least; uint32_t w;
     if (!count) return RTL_EINVAL;
     *count=0;
-    if (!d || (!views && cap)) return RTL_EINVAL;
+    if (!d || (!views && cap) || rtl_get_format(chip,&f)) return RTL_EINVAL;
+    h=f.rx_header; a=f.rx_align; least=chip==RTL_8159?18u:60u;
     while (off<len) {
         struct rtl_frame_view *v;
-        if (len-off<RTL_8159_HEADER) return RTL_ETRUNC;
+        if (len-off<h) return RTL_ETRUNC;
         w=le32(d+off);
-        wire=w>>17;
-        if (wire<18 || wire>RTL_MAX_FRAME+4u) return RTL_EFORMAT;
-        if (wire>len-off-RTL_8159_HEADER) return RTL_ETRUNC;
+        wire=chip==RTL_8159?w>>17:(w&0x7fffu);
+        if (wire<least || wire>RTL_MAX_FRAME+4u) return RTL_EFORMAT;
+        if (wire>len-off-h) return RTL_ETRUNC;
         if (n==cap) return RTL_ENOSPC;
         v=&views[n];
         memset(v,0,sizeof(*v));
-        v->data=d+off+RTL_8159_HEADER; v->len=wire-4u;
-        for (j=0;j<4;j++) v->status[j]=le32(d+off+j*4);
+        v->data=d+off+h; v->len=wire-4u;
+        for (j=0;j<h/4;j++) v->status[j]=le32(d+off+j*4);
         *count=++n;
-        off=(off+RTL_8159_HEADER+wire+15u)&~(size_t)15u;
+        off=(off+h+wire+a-1u)&~(a-1u);
     }
     return 0;
 }

@@ -157,7 +157,9 @@ static void descriptors(void)
     assert(rtl_parse_device(dev,sizeof dev,&d)==0 && d.vid==0xbda && d.pid==0x8156);
     assert(rtl_identify_target(&d,0x7400,&chip)==0 && chip==RTL_8156B);
     assert(rtl_identify_target(&d,0x7410,&chip)==0);
-    assert(rtl_identify_target(&d,0x7420,&chip)==RTL_EUNSUPPORTED);
+    assert(rtl_identify_target(&d,0x7420,&chip)==0 && chip==RTL_8156B);
+    assert(rtl_identify_target(&d,0x7020,&chip)==RTL_EUNSUPPORTED);
+    assert(rtl_identify_target(&d,0x7030,&chip)==RTL_EUNSUPPORTED);
     assert(rtl_identify_target(&d,0x2020,&chip)==RTL_EUNSUPPORTED);
     d.pid=0x815a;assert(rtl_identify_target(&d,0x2020,&chip)==0 && chip==RTL_8159);
     d.vid=0x1234;assert(rtl_identify_target(&d,0x2020,&chip)==RTL_EUNSUPPORTED);
@@ -236,7 +238,8 @@ static void bounded_random(void)
 static void vendor_helpers(void)
 {
     struct rtl_write w;
-    uint8_t h[RTL_8159_HEADER],buf[256],frame[60]={0};
+    uint8_t h[RTL_MAX_TX_HEADER],buf[512],frame[60]={0};
+    static const uint8_t tx1[8]={60,0,0,0xc0,0,0,0,0};
     static const uint8_t byte_cr[8]={0x40,5,0x10,0xe8,0x88,0x01,4,0};
     static const uint8_t word[8]={0x40,5,0x58,0xe8,0xcc,0x01,4,0};
     static const uint8_t dword[8]={0x40,5,0x0c,0xd4,0xff,0x00,4,0};
@@ -255,18 +258,27 @@ static void vendor_helpers(void)
     assert(rtl_write_request(&w,RTL_MCU_USB,0xd40e,4,0)==RTL_EINVAL);
     assert(rtl_write_request(&w,RTL_MCU_USB,0xd40c,1,0x100)==RTL_EINVAL);
     assert(rtl_write_request(&w,0x0200,0xd40c,4,0)==RTL_EINVAL);
-    assert(rtl_8159_tx_header(h,60)==0 && !memcmp(h,tx,16));
-    assert(rtl_8159_tx_header(h,59)==RTL_EINVAL);
+    assert(rtl_tx_header(RTL_8159,h,60)==16 && !memcmp(h,tx,16));
+    assert(rtl_tx_header(RTL_8159,h,59)==RTL_EINVAL);
+    assert(rtl_tx_header(RTL_8156B,h,60)==8 && !memcmp(h,tx1,8));
+    assert(rtl_tx_header((enum rtl_chip)0,h,60)==RTL_EINVAL);
     assert(rtl_rx_fixture_encode(RTL_8159,f,3,buf,sizeof buf,&written)==0);
-    assert(rtl_8159_rx_scan(buf,written,v,3,&count)==0 && count==3 && v[2].len==60 && v[0].data==buf+16);
+    assert(rtl_rx_scan(RTL_8159,buf,written,v,3,&count)==0 && count==3 && v[2].len==60 && v[0].data==buf+16);
     /* A bad second descriptor keeps the first frame; all-or-nothing decode does not. */
     put32(buf+80,0);
-    assert(rtl_8159_rx_scan(buf,written,v,3,&count)==RTL_EFORMAT && count==1);
+    assert(rtl_rx_scan(RTL_8159,buf,written,v,3,&count)==RTL_EFORMAT && count==1);
     assert(rtl_rx_decode(RTL_8159,buf,written,v,3,&count)!=0 && !count);
-    assert(rtl_8159_rx_scan(buf,70,v,3,&count)==RTL_ETRUNC && !count);
-    assert(rtl_8159_rx_scan(buf,0,v,3,&count)==0 && !count);
+    assert(rtl_rx_scan(RTL_8159,buf,70,v,3,&count)==RTL_ETRUNC && !count);
+    assert(rtl_rx_scan(RTL_8159,buf,0,v,3,&count)==0 && !count);
     put32(buf+80,64u<<17);
-    assert(rtl_8159_rx_scan(buf,written,v,1,&count)==RTL_ENOSPC && count==1);
+    assert(rtl_rx_scan(RTL_8159,buf,written,v,1,&count)==RTL_ENOSPC && count==1);
+    /* The RTL8156B: 24-byte descriptors on 8-byte boundaries, and the length in 15 bits. */
+    assert(rtl_rx_fixture_encode(RTL_8156B,f,3,buf,sizeof buf,&written)==0);
+    assert(rtl_rx_scan(RTL_8156B,buf,written,v,3,&count)==0 && count==3 && v[0].data==buf+24 && v[1].data==buf+112 && v[2].len==60);
+    assert(rtl_rx_decode(RTL_8156B,buf,written,v,3,&count)==0 && count==3);
+    put32(buf+88,59);
+    assert(rtl_rx_scan(RTL_8156B,buf,written,v,3,&count)==RTL_EFORMAT && count==1);
+    assert(rtl_rx_scan(RTL_8156B,buf,20,v,3,&count)==RTL_ETRUNC && !count);
 }
 int main(void)
 {

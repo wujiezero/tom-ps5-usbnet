@@ -25,10 +25,14 @@
 #define UNCONFIGURED 0xff
 #define SHORT_XFER_OK 0x0004            /* USB_SHORT_XFER_OK: usbdi.h is kernel-only */
 
-/* The vendor's own IDs. An OEM ID is not guessed at: the run stops instead. */
-static const uint16_t g_products[] = {0x815a};
+/* The vendor's own IDs: the RTL8159 and the RTL8156 family, whose silicon is told apart
+ * by its version once the node is open. An OEM ID is not guessed at. */
+static const uint16_t g_products[] = {0x815a, 0x8156};
+#define MAX_SEEN 8
 
 int adapter_gone;
+static uint32_t g_seen[MAX_SEEN];
+static int g_seen_count;
 
 static long now_ms(void)
 {
@@ -60,18 +64,52 @@ static int read_config(int fd, int index, uint8_t *data, size_t cap)
     return gd.ugd_actlen < cap ? gd.ugd_actlen : (int)cap;
 }
 
+/* The ECM configuration, for its pass-through and its MAC string. Without one, an NCM
+ * configuration's MAC string will do, and there is no pass-through. */
 static int find_ecm_config(int fd, int configurations, struct adapter *a)
 {
     static uint8_t config[CONFIG_BYTES];
-    int i;
+    struct ncm_function ncm;
+    int i, have_ncm = 0;
 
     if (configurations > MAX_CONFIGS) configurations = MAX_CONFIGS;
     for (i = 0; i < configurations && a->ecm_index < 0; i++) {
         int len = read_config(fd, i, config, sizeof config);
 
-        if (len > 0 && ncm_find_ecm_function(config, (size_t)len, &a->ecm) == NCM_OK) a->ecm_index = i;
+        if (len <= 0) continue;
+        if (ncm_find_ecm_function(config, (size_t)len, &a->ecm) == NCM_OK) a->ecm_index = i;
+        else if (!have_ncm && ncm_find_function(config, (size_t)len, &ncm) == NCM_OK) have_ncm = 1;
     }
-    return a->ecm_index < 0 ? -1 : 0;
+    if (a->ecm_index < 0 && have_ncm) {
+        a->ecm = ncm;
+        say("no ECM configuration: the address comes from the NCM one");
+    }
+    return a->ecm_index >= 0 || have_ncm ? 0 : -1;
+}
+
+/* What else is on the bus goes in the log, as vendor:product only, so that an adapter
+ * this does not know can be named in a report. */
+static void note_device(const struct usb_device_descriptor *dd)
+{
+    uint32_t id = (uint32_t)UGETW(dd->idVendor) << 16 | UGETW(dd->idProduct);
+    int i;
+
+    if (dd->bDeviceClass == 0x09) return;      /* hubs */
+    for (i = 0; i < g_seen_count; i++)
+        if (g_seen[i] == id) return;
+    if (g_seen_count < MAX_SEEN) g_seen[g_seen_count++] = id;
+}
+
+static void log_seen(void)
+{
+    char line[MAX_SEEN * 10 + 1];
+    size_t used = 0;
+    int i;
+
+    for (i = 0; i < g_seen_count; i++)
+        used += (size_t)snprintf(line + used, sizeof line - used, "%s%04x:%04x", i ? " " : "", g_seen[i] >> 16, g_seen[i] & 0xffff);
+    if (g_seen_count) say("usb devices: %s", line);
+    else say("usb devices: none");
 }
 
 /* 1: found, 0: not this node, -1: the adapter, without the configuration it needs. */
@@ -84,8 +122,15 @@ static int probe_node(const char *path, struct adapter *a)
     if (stat(path, &st) != 0) return 0;
     fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) return 0;
-    if (ioctl(fd, USB_GET_DEVICE_DESC, &dd) == 0 && is_target(&dd)) {
+    if (ioctl(fd, USB_GET_DEVICE_DESC, &dd) != 0) {
+        close(fd);
+        return 0;
+    }
+    if (!is_target(&dd)) {
+        note_device(&dd);
+    } else {
         say("adapter %04x:%04x", UGETW(dd.idVendor), UGETW(dd.idProduct));
+        a->product = UGETW(dd.idProduct);
         if (ioctl(fd, USB_GET_CONFIG, &value) == 0) a->original_index = value & 0xff;
         if (find_ecm_config(fd, dd.bNumConfigurations, a) == 0) {
             snprintf(a->path, sizeof a->path, "%s", path);
@@ -245,15 +290,14 @@ int adapter_main(void (*run)(struct adapter *adapter))
     a.ecm_index = -1;
     if (find_adapter(&a) != 0) {
         say("no supported adapter found");
-        notify("未找到支持的网卡");
-        return 1;
+        log_seen();
+        return ADAPTER_NONE;
     }
     a.active_index = a.original_index;
     a.fd = open(a.path, O_RDWR);
     if (a.fd < 0) {
         say("adapter: open errno %d", errno);
-        notify("无法打开网卡");
-        return 1;
+        return ADAPTER_NONE;
     }
     run(&a);
     if (a.fd >= 0 && !adapter_gone) {
@@ -262,5 +306,5 @@ int adapter_main(void (*run)(struct adapter *adapter))
             say("configuration not restored: replug the adapter");
     }
     if (a.fd >= 0) close(a.fd);
-    return 0;
+    return a.unusable ? ADAPTER_NONE : 0;
 }

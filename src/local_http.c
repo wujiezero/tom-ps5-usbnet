@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* The icon opens the console's own browser, and that browser's network is the
  * console's, not this ELF's lwIP. So the same routes also listen on the kernel's
- * sockets, bound to the loopback address and to nothing else: this listener cannot be
- * reached from any network. */
+ * sockets. With an adapter, bound to the loopback address and to nothing else: this
+ * listener cannot be reached from any network. Without one it is the page itself, on
+ * every address the console has. */
 #include "local_http.h"
 #include "log.h"
 
@@ -33,7 +34,7 @@ struct connection {
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static const struct http_backend *g_backend;
-static int g_listener = -1, g_stop, g_workers, g_running;
+static int g_listener = -1, g_stop, g_workers, g_running, g_broken;
 
 static ssize_t stream_read(void *context, void *data, size_t length)
 {
@@ -102,10 +103,25 @@ static void *accept_main(void *unused)
 
     (void)unused;
     while (!__atomic_load_n(&g_stop, __ATOMIC_RELAXED)) {
-        if (poll(&wait, 1, LOCAL_POLL_MS) > 0) {
+        int ready = poll(&wait, 1, LOCAL_POLL_MS);
+
+        if (ready < 0 && errno != EINTR) {
+            __atomic_store_n(&g_broken, 1, __ATOMIC_RELAXED);
+            break;
+        }
+        if (ready > 0 && (wait.revents & (POLLERR | POLLNVAL))) {
+            __atomic_store_n(&g_broken, 1, __ATOMIC_RELAXED);
+            break;
+        }
+        if (ready > 0) {
             int fd = accept(g_listener, NULL, NULL);
 
             if (fd >= 0) start_worker(fd);
+            else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK && errno != ECONNABORTED && errno != EMFILE &&
+                    errno != ENFILE && errno != ENOBUFS) {
+                __atomic_store_n(&g_broken, 1, __ATOMIC_RELAXED);
+                break;
+            }
         }
     }
     close(g_listener);
@@ -114,7 +130,7 @@ static void *accept_main(void *unused)
     return NULL;
 }
 
-int local_http_start(const struct http_backend *backend, uint16_t port)
+int local_http_start(const struct http_backend *backend, uint16_t port, int every_address)
 {
     struct sockaddr_in address;
     pthread_attr_t attr;
@@ -128,13 +144,19 @@ int local_http_start(const struct http_backend *backend, uint16_t port)
     memset(&address, 0, sizeof address);
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
+#ifdef LOCAL_HTTP_TESTING
+    (void)every_address;                /* the host's own network is no business of a test */
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#else
+    address.sin_addr.s_addr = htonl(every_address ? INADDR_ANY : INADDR_LOOPBACK);
+#endif
     if (bind(g_listener, (struct sockaddr *)&address, sizeof address) != 0 || listen(g_listener, LOCAL_BACKLOG) != 0) {
         close(g_listener);
         g_listener = -1;
         return -1;
     }
     g_stop = 0;
+    g_broken = 0;
     __atomic_store_n(&g_running, 1, __ATOMIC_RELAXED);
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -164,4 +186,9 @@ void local_http_stop(void)
         usleep(LOCAL_TICK_US);
     }
     say("local page: connections were still open when the run ended");
+}
+
+int local_http_broken(void)
+{
+    return __atomic_load_n(&g_broken, __ATOMIC_RELAXED);
 }

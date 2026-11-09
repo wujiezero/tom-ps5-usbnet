@@ -26,6 +26,7 @@ extern unsigned char *net_heap;
 #define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "peer: %s line %d\n", #condition, __LINE__); _exit(2); } } while (0)
 
 const char *peer_files_root;
+unsigned peer_link_mbps = 10000;      /* what the simulated chip reports */
 
 static struct netif g_netif;
 static int g_cable;
@@ -314,6 +315,101 @@ static void files(void)
     CHECK(r.status == 200);
 }
 
+/* ---- a NAS that turns the console away -------------------------------------- */
+/* It answers the first SMB2 request, the NEGOTIATE, with STATUS_ACCESS_DENIED: enough
+ * for libsmb2 to go through every socket call the console's side makes on lwIP. */
+static int g_nas_negotiated;
+
+static int read_exactly(int fd, unsigned char *p, size_t length)
+{
+    while (length) {
+        ssize_t n = lwip_read(fd, p, length);
+
+        if (n <= 0) return -1;
+        p += n;
+        length -= (size_t)n;
+    }
+    return 0;
+}
+
+static void *fake_nas(void *unused)
+{
+    struct sockaddr_in address;
+    int listener = lwip_socket(AF_INET, SOCK_STREAM, 0), one = 1;
+
+    (void)unused;
+    CHECK(listener >= 0);
+    lwip_setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    memset(&address, 0, sizeof address);
+    address.sin_len = sizeof address;
+    address.sin_family = AF_INET;
+    address.sin_port = lwip_htons(445);
+    address.sin_addr.s_addr = SERVER_IP;
+    CHECK(lwip_bind(listener, (struct sockaddr *)&address, sizeof address) == 0);
+    CHECK(lwip_listen(listener, 1) == 0);
+    for (;;) {
+        static unsigned char request[65536];
+        unsigned char reply[4 + 64 + 9];
+        struct sockaddr_in from;
+        socklen_t from_length = sizeof from;
+        int fd = lwip_accept(listener, (struct sockaddr *)&from, &from_length);
+        size_t length;
+
+        CHECK(fd >= 0);
+        CHECK(from.sin_addr.s_addr == CLIENT_IP);
+        if (read_exactly(fd, request, 4) == 0) {
+            length = (size_t)request[1] << 16 | (size_t)request[2] << 8 | request[3];
+            CHECK(request[0] == 0 && length >= 64 && length <= sizeof request);
+            CHECK(read_exactly(fd, request, length) == 0);
+            CHECK(!memcmp(request, "\xfeSMB", 4) && request[12] == 0 && request[13] == 0);
+            memset(reply, 0, sizeof reply);
+            reply[3] = 64 + 9;
+            memcpy(reply + 4, "\xfeSMB", 4);
+            reply[4 + 4] = 64;                          /* StructureSize */
+            reply[4 + 8] = 0x22;                        /* STATUS_ACCESS_DENIED, LE */
+            reply[4 + 11] = 0xc0;
+            reply[4 + 14] = 1;                          /* one credit */
+            reply[4 + 16] = 1;                          /* from the server */
+            memcpy(reply + 4 + 24, request + 24, 8);    /* MessageId */
+            reply[4 + 64] = 9;                          /* the error body */
+            write_all(fd, reply, sizeof reply);
+            __atomic_add_fetch(&g_nas_negotiated, 1, __ATOMIC_RELAXED);
+            while (lwip_read(fd, request, sizeof request) > 0) {}
+        }
+        lwip_close(fd);
+    }
+    return NULL;
+}
+
+static void post_form(const char *target, const char *form, struct reply *r)
+{
+    char head[512];
+    int fd = connect_app();
+    int n = snprintf(head, sizeof head, "POST %s HTTP/1.1\r\nHost: 192.0.2.50\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", target, strlen(form));
+
+    write_all(fd, head, (size_t)n);
+    write_all(fd, form, strlen(form));
+    read_reply(fd, r);
+    lwip_close(fd);
+}
+
+static void nas(void)
+{
+    char target[64];
+    struct reply r;
+    long id;
+
+    post_form("/smb/save", "host=192.0.2.1&user=me&password=pw", &r);
+    CHECK(r.status == 200);
+    id = json_number(r.body, "id");
+    request("GET", "/smb/servers", "", &r);
+    CHECK(r.status == 200 && strstr(r.body, "\"host\":\"192.0.2.1\"") && !strstr(r.body, "pw\""));
+    snprintf(target, sizeof target, "/smb/shares?id=%ld", id);
+    request("GET", target, "", &r);
+    CHECK(r.status == 409 && strstr(r.body, "\"error\":\"nas_denied\""));
+    CHECK(__atomic_load_n(&g_nas_negotiated, __ATOMIC_RELAXED) == 1);
+}
+
 static void client(void)
 {
     struct reply r;
@@ -321,12 +417,14 @@ static void client(void)
     request("GET", "/", "", &r);
     CHECK(r.status == 200 && strstr(r.body, "<title>tom-ps5-usbnet"));
     request("GET", "/api/info", "", &r);
-    CHECK(r.status == 200 && strstr(r.body, "\"ip\":\"192.0.2.50\"") && json_number(r.body, "link_mbps") == 10000);
+    CHECK(r.status == 200 && strstr(r.body, "\"ip\":\"192.0.2.50\"") && json_number(r.body, "link_mbps") == peer_link_mbps &&
+        json_number(r.body, "max_mbps") == peer_link_mbps && strstr(r.body, "\"mode\":\"usb\""));
     request("GET", "/nothing", "", &r);
     CHECK(r.status == 404);
     request("POST", "/api/exit", "Origin: http://elsewhere.example\r\n", &r);
     CHECK(r.status == 403);
     files();
+    nas();
     request("POST", "/api/exit", "", &r);
     CHECK(r.status == 200);
 }
@@ -340,6 +438,7 @@ int peer_main(int fd)
     CHECK(net_heap);
     stack_start();
     pthread_create(&thread, NULL, dhcp_server, NULL);
+    pthread_create(&thread, NULL, fake_nas, NULL);
     client();
     sys_msleep(100);
     return 0;
