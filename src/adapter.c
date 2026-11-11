@@ -25,9 +25,9 @@
 #define UNCONFIGURED 0xff
 #define SHORT_XFER_OK 0x0004            /* USB_SHORT_XFER_OK: usbdi.h is kernel-only */
 
-/* The vendor's own IDs: the RTL8159 and the RTL8156 family, whose silicon is told apart
- * by its version once the node is open. An OEM ID is not guessed at. */
-static const uint16_t g_products[] = {0x815a, 0x8156};
+/* The vendor's own IDs: the RTL8159, the RTL8157 and the RTL8156 family, whose silicon
+ * is told apart by its version once the node is open. An OEM ID is not guessed at. */
+static const uint16_t g_products[] = {0x815a, 0x8157, 0x8156};
 #define MAX_SEEN 8
 
 int adapter_gone;

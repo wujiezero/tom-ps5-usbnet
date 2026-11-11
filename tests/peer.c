@@ -170,7 +170,7 @@ struct reply {
     size_t total;
 };
 
-static int connect_app(void)
+static int connect_port(uint16_t port)
 {
     struct sockaddr_in address;
     struct timeval timeout = {30, 0};
@@ -179,7 +179,7 @@ static int connect_app(void)
     memset(&address, 0, sizeof address);
     address.sin_len = sizeof address;
     address.sin_family = AF_INET;
-    address.sin_port = lwip_htons(80);
+    address.sin_port = lwip_htons(port);
     address.sin_addr.s_addr = CLIENT_IP;
     for (tries = 0; tries < 600; tries++) {
         int fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
@@ -192,6 +192,11 @@ static int connect_app(void)
     }
     CHECK(!"connected");
     return -1;
+}
+
+static int connect_app(void)
+{
+    return connect_port(80);
 }
 
 static void write_all(int fd, const void *data, size_t length)
@@ -410,6 +415,70 @@ static void nas(void)
     CHECK(__atomic_load_n(&g_nas_negotiated, __ATOMIC_RELAXED) == 1);
 }
 
+/* ---- ports of the console's own services, through the adapter's address ---------- */
+/* test_app.c runs an echo on 127.0.0.1:19201 and an FTP server on 19203. */
+
+static void read_line(int fd, char *line, size_t capacity)
+{
+    size_t used = 0;
+
+    for (;;) {
+        char c;
+
+        CHECK(lwip_read(fd, &c, 1) == 1);
+        if (c == '\n') break;
+        if (c != '\r' && used + 1 < capacity) line[used++] = c;
+    }
+    line[used] = 0;
+}
+
+static size_t read_rest(int fd, char *out, size_t capacity)
+{
+    size_t used = 0;
+    ssize_t n;
+
+    while (used < capacity && (n = lwip_read(fd, out + used, capacity - used)) > 0) used += (size_t)n;
+    return used;
+}
+
+static void forwarding(void)
+{
+    enum { ECHO = 256 * 1024 };
+    static char data[ECHO], back[ECHO + 1];
+    unsigned a, b, c, d, high, low;
+    char line[256];
+    struct reply r;
+    size_t i;
+    int fd, passive;
+
+    post_form("/fwd/save", "19200 19201 1 echo\n19202 19203 1 ftp\n", &r);
+    CHECK(r.status == 200 && strstr(r.body, "\"port\":19200,\"to\":19201,\"on\":true,\"name\":\"echo\",\"state\":\"listening\""));
+    CHECK(strstr(r.body, "\"running\":true"));
+    for (i = 0; i < ECHO; i++) data[i] = (char)(i * 13 + i / 1000);
+    fd = connect_port(19200);
+    write_all(fd, data, ECHO);
+    lwip_shutdown(fd, SHUT_WR);
+    CHECK(read_rest(fd, back, sizeof back) == ECHO && !memcmp(back, data, ECHO));
+    lwip_close(fd);
+    fd = connect_port(19202);
+    read_line(fd, line, sizeof line);
+    CHECK(!strcmp(line, "220 fake ftp"));
+    write_all(fd, "PASV\r\n", 6);
+    read_line(fd, line, sizeof line);
+    CHECK(sscanf(line, "227 Entering Passive Mode (%u,%u,%u,%u,%u,%u).", &a, &b, &c, &d, &high, &low) == 6);
+    CHECK(a == 192 && b == 0 && c == 2 && d == 50);     /* the adapter's, not 127.0.0.1 */
+    passive = connect_port((uint16_t)(high << 8 | low));
+    memset(line, 0, sizeof line);
+    CHECK(read_rest(passive, line, sizeof line - 1) == 9 && !strcmp(line, "DATA-PASV"));
+    lwip_close(passive);
+    read_line(fd, line, sizeof line);
+    CHECK(!strcmp(line, "226 done"));
+    write_all(fd, "QUIT\r\n", 6);
+    read_line(fd, line, sizeof line);
+    CHECK(!strcmp(line, "221 bye"));
+    lwip_close(fd);
+}
+
 static void client(void)
 {
     struct reply r;
@@ -419,12 +488,15 @@ static void client(void)
     request("GET", "/api/info", "", &r);
     CHECK(r.status == 200 && strstr(r.body, "\"ip\":\"192.0.2.50\"") && json_number(r.body, "link_mbps") == peer_link_mbps &&
         json_number(r.body, "max_mbps") == peer_link_mbps && strstr(r.body, "\"mode\":\"usb\""));
+    request("GET", "/icon.png", "", &r);
+    CHECK(r.status == 200 && strstr(r.head, "image/png") && !memcmp(r.body, "\x89PNG", 4));
     request("GET", "/nothing", "", &r);
     CHECK(r.status == 404);
     request("POST", "/api/exit", "Origin: http://elsewhere.example\r\n", &r);
     CHECK(r.status == 403);
     files();
     nas();
+    forwarding();
     request("POST", "/api/exit", "", &r);
     CHECK(r.status == 200);
 }

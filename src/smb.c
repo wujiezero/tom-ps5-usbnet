@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* See smb.h. As with the rest of the page there is no login: whoever reaches the port
- * can use the saved servers, but cannot read their passwords back. A copy writes
+ * can use the saved servers, but cannot read their passwords back, and nas.txt holds
+ * them sealed to this console (secret.h). A copy writes
  * nowhere files.c would refuse, through its job slot, and each file goes to
  * <name>.tom-part first, as an upload does. While one buffer is written to disk the
  * next is read from the share. */
 #include "smb.h"
 #include "files.h"
+#include "secret.h"
 #include "smb_client.h"
 
 #include <sys/stat.h>
@@ -34,6 +36,10 @@ struct saved {
     unsigned id;
     char name[NAME_BYTES];
     struct smb_server server;
+    /* A sealed password that would not open here, kept as it is so that a run without
+     * the key loses nothing. Cleared once a password is typed again. */
+    char sealed[SECRET_HEX];
+    int plain_on_disk;                  /* read from a version 1 line, password in clear */
 };
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -171,8 +177,10 @@ static int good_path(const char *path)
 }
 
 /* ---- the saved servers ----------------------------------------------------- */
-/* One line for each: "1 <id> <name> <host> <port> <user> <domain> <password>", the
- * texts in hex, so nothing in them can break a line. The file is the owner's only. */
+/* One line for each: "2 <id> <name> <host> <port> <user> <domain> <password>", the
+ * texts in hex, so nothing in them can break a line, and the password sealed. Version
+ * 1 lines, which 0.2 wrote, hold the password in clear: they are read, and rewritten
+ * sealed as soon as there is a key. The file is the owner's only. */
 
 static void put_hex(FILE *f, const char *s)
 {
@@ -199,11 +207,19 @@ static int get_hex(const char *hex, char *out, size_t capacity)
     return plain(out) ? 0 : -1;
 }
 
+/* What a sealed password belongs to, so that one cannot be moved to another entry. */
+static void context_of(const struct saved *s, char *out, size_t capacity)
+{
+    snprintf(out, capacity, "%u\n%s\n%s\n%s", s->id, s->server.host, s->server.user, s->server.domain);
+}
+
+static int store(void);
+
 static void load(void)
 {
     FILE *f;
-    char *line;
-    int n = 0;
+    char *line, context[256];
+    int n = 0, migrate = 0;
 
     if (g_loaded) return;
     g_loaded = 1;
@@ -221,14 +237,26 @@ static void load(void)
             p = NULL;
             count++;
         }
-        if (count != 8 || strcmp(field[0], "1")) continue;
+        if (count != 8 || (strcmp(field[0], "1") && strcmp(field[0], "2"))) continue;
         s->id = (unsigned)strtoul(field[1], NULL, 10);
         port = strtoul(field[4], NULL, 10);
         if (!s->id || port > 65535 || get_hex(field[2], s->name, sizeof s->name) || get_hex(field[3], s->server.host, sizeof s->server.host) ||
             get_hex(field[5], s->server.user, sizeof s->server.user) || get_hex(field[6], s->server.domain, sizeof s->server.domain) ||
-            get_hex(field[7], s->server.password, sizeof s->server.password) || !good_host(s->server.host)) {
+            !good_host(s->server.host)) {
             wipe(s, sizeof *s);
             continue;
+        }
+        if (field[0][0] == '1') {
+            if (get_hex(field[7], s->server.password, sizeof s->server.password)) {
+                wipe(s, sizeof *s);
+                continue;
+            }
+            s->plain_on_disk = s->server.password[0] != 0;
+            migrate |= s->plain_on_disk;
+        } else if (strcmp(field[7], "-")) {
+            context_of(s, context, sizeof context);
+            if (secret_open(context, field[7], s->server.password, sizeof s->server.password) != 0)
+                snprintf(s->sealed, sizeof s->sealed, "%s", strlen(field[7]) < sizeof s->sealed ? field[7] : "");
         }
         s->server.port = (unsigned)port;
         if (s->id >= g_next_id) g_next_id = s->id + 1;
@@ -239,6 +267,7 @@ static void load(void)
         free(line);
     }
     fclose(f);
+    if (migrate && secret_ready()) (void)store();
 }
 
 static int store(void)
@@ -258,10 +287,22 @@ static int store(void)
         return -1;
     }
     for (i = 0; i < MAX_SERVERS; i++) {
-        const struct saved *s = &g_saved[i];
+        struct saved *s = &g_saved[i];
+        char sealed[SECRET_HEX], context[256];
+        int clear = 0;
 
         if (!s->id) continue;
-        fprintf(f, "1 %u ", s->id);
+        sealed[0] = 0;
+        if (s->server.password[0]) {
+            context_of(s, context, sizeof context);
+            /* Without a key a password stays as it was on disk: in clear only if it
+             * already was, since save() takes no new password without one. */
+            if (secret_seal(context, s->server.password, sealed, sizeof sealed) != 0) clear = 1;
+            if (clear && !s->plain_on_disk) result = -1;
+        } else if (s->sealed[0]) {
+            snprintf(sealed, sizeof sealed, "%s", s->sealed);
+        }
+        fprintf(f, "%c %u ", clear ? '1' : '2', s->id);
         put_hex(f, s->name);
         fputc(' ', f);
         put_hex(f, s->server.host);
@@ -270,13 +311,17 @@ static int store(void)
         fputc(' ', f);
         put_hex(f, s->server.domain);
         fputc(' ', f);
-        put_hex(f, s->server.password);
+        if (clear) put_hex(f, s->server.password);
+        else fputs(sealed[0] ? sealed : "-", f);
         fputc('\n', f);
+        wipe(sealed, sizeof sealed);
     }
     if (fflush(f) != 0 || fsync(fileno(f)) != 0) result = -1;
     if (fclose(f) != 0) result = -1;
     if (!result && rename(temporary, g_store) != 0) result = -1;
     if (result) unlink(temporary);
+    for (i = 0; !result && i < MAX_SERVERS; i++)
+        if (g_saved[i].server.password[0] && secret_ready()) g_saved[i].plain_on_disk = 0;
     return result;
 }
 
@@ -325,7 +370,9 @@ static int servers(struct http_stream *stream)
         add_string(&t, s->server.user);
         add_text(&t, ",\"domain\":");
         add_string(&t, s->server.domain);
-        add_text(&t, s->server.password[0] ? ",\"password\":true}" : ",\"password\":false}");
+        add_text(&t, s->server.password[0] ? ",\"password\":true" : ",\"password\":false");
+        /* Saved, but sealed on another console or with a key this run does not have. */
+        add_text(&t, !s->server.password[0] && s->sealed[0] ? ",\"locked\":true}" : "}");
         first = 0;
     }
     pthread_mutex_unlock(&g_lock);
@@ -394,6 +441,11 @@ static int save(const struct http_request *r, struct http_stream *stream)
     wipe(body, BODY_BYTES);
     free(body);
     if (!entry.server.host[0]) return error(stream, 400, "bad_request");
+    /* A password is kept only sealed. */
+    if (has_password && entry.server.password[0] && !secret_ready()) {
+        wipe(&entry, sizeof entry);
+        return error(stream, 409, "no_key");
+    }
     if (!entry.name[0]) snprintf(entry.name, sizeof entry.name, "%s", entry.server.host);
     pthread_mutex_lock(&g_lock);
     load();
@@ -405,7 +457,11 @@ static int save(const struct http_request *r, struct http_stream *stream)
             return error(stream, 404, "not_found");
         }
         entry.id = slot->id;
-        if (!has_password) memcpy(entry.server.password, slot->server.password, sizeof entry.server.password);
+        if (!has_password) {
+            memcpy(entry.server.password, slot->server.password, sizeof entry.server.password);
+            memcpy(entry.sealed, slot->sealed, sizeof entry.sealed);
+            entry.plain_on_disk = slot->plain_on_disk;
+        }
     } else {
         for (i = 0; i < MAX_SERVERS && !slot; i++)
             if (!g_saved[i].id) slot = &g_saved[i];

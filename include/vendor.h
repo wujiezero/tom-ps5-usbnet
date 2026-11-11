@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #ifndef VENDOR_H
 #define VENDOR_H
-/* The vendor configuration of the RTL8159 and the RTL8156B: what Linux's r8152 driver
+/* The vendor configuration of the RTL8159, the RTL8157 and the RTL8156B: what Linux's r8152 driver
  * does, without the PHY. vendor.c moves aggregated bulk transfers, vendor_regs.c sets
  * the chip up. */
 #include "frame.h"
@@ -43,7 +43,7 @@ void vnd_unlock(void);
 /* ---- the chip ---- */
 /* `version` is PLA_TCR0's, as rtl_version_reply gives it. */
 void vnd_regs_attach(int fd, enum rtl_chip chip, uint16_t version);
-/* The fastest link the chip has: 10000 or 2500. */
+/* The fastest link the chip has: 10000, 5000 or 2500. */
 unsigned vnd_regs_max_mbps(void);
 /* PLA_TCR0's version, read before anything is written. 0 if it could not be read. */
 uint16_t vnd_regs_read_version(int fd);

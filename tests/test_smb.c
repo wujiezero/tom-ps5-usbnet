@@ -2,6 +2,7 @@
 /* The NAS routes through the real HTTP layer and the file manager's job, against a
  * share that is a local folder (smb_fake.c). */
 #include "files.h"
+#include "secret.h"
 #include "smb.h"
 
 #include <errno.h>
@@ -199,6 +200,94 @@ static void saved(void)
     CHECK(!strcmp(smb_fake_password, "p&w\"rd"));
 }
 
+/* Two consoles, and one whose ID cannot be read. */
+static int g_console = 'A';
+static int console_id(uint8_t id[16])
+{
+    if (!g_console) return -1;
+    memset(id, g_console, 16);
+    return 0;
+}
+
+static char *slurp(const char *path)
+{
+    static char text[8192];
+    FILE *f = fopen(path, "r");
+    size_t n;
+
+    CHECK(f);
+    n = fread(text, 1, sizeof text - 1, f);
+    fclose(f);
+    text[n] = 0;
+    return text;
+}
+
+static void reload(int console)
+{
+    g_console = console;
+    secret_set_source(console_id);
+    smb_set_store(g_store);
+}
+
+static void sealing(void)
+{
+    char sealed[SECRET_HEX], plain[SECRET_MAX + 1], keep[SECRET_HEX], before[8192], *text, *line;
+    FILE *f;
+
+    /* The module: a round trip, then a wrong context, a changed byte, another console. */
+    CHECK(secret_ready());
+    CHECK(secret_seal("1\nnas", "pa ss", sealed, sizeof sealed) == 0 && strlen(sealed) == SECRET_HEX - 1);
+    CHECK(secret_open("1\nnas", sealed, plain, sizeof plain) == 0 && !strcmp(plain, "pa ss"));
+    CHECK(secret_open("2\nnas", sealed, plain, sizeof plain) != 0);
+    sealed[40] = sealed[40] == '0' ? '1' : '0';
+    CHECK(secret_open("1\nnas", sealed, plain, sizeof plain) != 0);
+    sealed[40] = sealed[40] == '0' ? '1' : '0';
+    CHECK(secret_seal("1\nnas", "pa ss", keep, sizeof keep) == 0 && strcmp(keep, sealed));   /* a fresh nonce */
+    reload('B');
+    CHECK(secret_open("1\nnas", sealed, plain, sizeof plain) != 0);
+    reload('A');
+
+    /* What saved() wrote: version 2 lines, no password in any form. */
+    text = slurp(g_store);
+    CHECK(!strncmp(text, "2 ", 2) && !strstr(text, "\n1 ") && !strstr(text, "702677227264") && !strstr(text, "p&w"));
+    snprintf(before, sizeof before, "%s", text);
+
+    /* A 0.2 file, password in clear, is rewritten sealed on reading. */
+    f = fopen(g_store, "w");
+    CHECK(f);
+    fputs("1 7 6f6c64 6f6c642e74657374 0 6d65 - 736563726574\n", f);   /* old, old.test, me, "secret" */
+    fclose(f);
+    reload('A');
+    CHECK(simple("GET", "/smb/servers", NULL, "\"name\":\"old\"") == 200);
+    text = slurp(g_store);
+    CHECK(!strncmp(text, "2 7 ", 4) && !strstr(text, "736563726574"));
+    CHECK(simple("GET", "/smb/shares?id=7", NULL, "\"name\":\"media\"") == 200);
+    CHECK(!strcmp(smb_fake_password, "secret"));
+
+    /* On another console the password does not open, and is kept for its own. */
+    reload('B');
+    CHECK(simple("GET", "/smb/servers", NULL, "\"password\":false,\"locked\":true") == 200);
+    line = strrchr(slurp(g_store), ' ');
+    snprintf(keep, sizeof keep, "%.*s", (int)strcspn(line + 1, "\n"), line + 1);
+    CHECK(simple("POST", "/smb/save", "host=guest.test", "{\"id\":8}") == 200);
+    CHECK(strstr(slurp(g_store), keep));
+    CHECK(simple("POST", "/smb/save", "id=7&host=old.test&user=me&password=new", "{\"id\":7}") == 200);
+    CHECK(!strstr(slurp(g_store), keep));
+    reload('A');                         /* now sealed on B: not A's any more */
+    CHECK(simple("GET", "/smb/servers", NULL, "\"locked\":true") == 200);
+
+    /* No key: no new password, but guests and what is on disk are fine. */
+    reload(0);
+    CHECK(simple("POST", "/smb/save", "host=nas.test&user=me&password=x", "no_key") == 409);
+    CHECK(simple("POST", "/smb/save", "host=guest2.test", "{\"id\":9}") == 200);
+    CHECK(strstr(slurp(g_store), "2 7 "));
+    /* Back to what saved() left, for the tests after this one. */
+    f = fopen(g_store, "w");
+    CHECK(f && fputs(before, f) >= 0 && fclose(f) == 0);
+    reload('A');
+    CHECK(simple("GET", "/smb/servers", NULL, "\"name\":\"Home\"") == 200);
+}
+
 static void browsing(void)
 {
     char *body = NULL;
@@ -315,8 +404,10 @@ int main(void)
     put(path, 3 * 1024 * 1024 + 17, 3);
     smb_fake_root = g_nas;
     files_test_root = g_volume;
+    secret_set_source(console_id);
     smb_set_store(g_store);
     saved();
+    sealing();
     browsing();
     copies();
     forgetting();

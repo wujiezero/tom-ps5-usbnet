@@ -9,7 +9,8 @@ extern "C" {
 #endif
 
 /* Pure memory codec; no USB, OS networking, allocation, or mutable globals. */
-enum rtl_chip { RTL_8156B = 1, RTL_8159 = 2 };
+/* The RTL8157 and the RTL8159 share one descriptor format. */
+enum rtl_chip { RTL_8156B = 1, RTL_8159 = 2, RTL_8157 = 3 };
 enum rtl_result {
     RTL_OK = 0, RTL_EINVAL = -1, RTL_ETRUNC = -2,
     RTL_EFORMAT = -3, RTL_ENOSPC = -4, RTL_EUNSUPPORTED = -5
@@ -76,7 +77,8 @@ int rtl_parse_config(const uint8_t *data, size_t len,
 /* chip_version is PLA_TCR1 register value, NOT USB bcdDevice. Reference Realtek
  * VID/PIDs plus compatible observed silicon revision are required. Returns only
  * a target family declaration, not proof of commercial adapter compatibility.
- * 8156B: 0x7400/0x7410/0x7420; 8159: 0x2020 (mask 0x7cf0). OEM IDs fail closed. */
+ * 8156B: 0x7400/0x7410/0x7420; 8157: 0x1030; 8159: 0x2020 (mask 0x7cf0). OEM IDs fail
+ * closed. */
 int rtl_identify_target(const struct rtl_usb_device *device,
     uint16_t chip_version, enum rtl_chip *out);
 /* Pure 8-byte USB SETUP data for the upstream read-only PLA_TCR0 version
@@ -105,7 +107,7 @@ unsigned rtl_byte_write_index(unsigned mcu, unsigned address);
 struct rtl_write { uint8_t setup[8], data[4]; };
 int rtl_write_request(struct rtl_write *out, unsigned mcu, unsigned address, unsigned width, uint32_t value);
 /* The TX descriptor of one frame of `len` bytes, no offload: 8 bytes on the RTL8156B,
- * 16 on the RTL8159. Returns its length, or RTL_EINVAL. */
+ * 16 on the RTL8157 and RTL8159. Returns its length, or RTL_EINVAL. */
 #define RTL_MAX_TX_HEADER 16u
 int rtl_tx_header(enum rtl_chip chip, uint8_t *header, size_t len);
 /* Walks a bulk IN aggregate as Linux's rx_bottom does: every frame before the first bad

@@ -12,9 +12,11 @@
 #include "adapter.h"
 #include "crash.h"
 #include "files.h"
+#include "forward.h"
 #include "local_http.h"
 #include "log.h"
 #include "net.h"
+#include "secret.h"
 #include "smb.h"
 #include "smb_client.h"
 #include "tile.h"
@@ -70,7 +72,7 @@ void net_assert(const char *what, const char *file, int line)
 
 static const char *chip_name(void)
 {
-    return g.native ? "" : g.chip == RTL_8156B ? "RTL8156B" : "RTL8159";
+    return g.native ? "" : g.chip == RTL_8156B ? "RTL8156B" : g.chip == RTL_8157 ? "RTL8157" : "RTL8159";
 }
 
 static int info(void *context, char *out, size_t capacity)
@@ -113,12 +115,17 @@ static int route(void *context, const struct http_request *request, struct http_
         tile_install();
         return http_respond(stream, 200, "application/json", "{}");
     }
+    result = forward_route(request, stream);
+    if (result != HTTP_NOT_MINE) return result;
     result = smb_route(request, stream);
     return result != HTTP_NOT_MINE ? result : files_route(request, stream);
 }
 
 #ifndef SMB_STORE
 #define SMB_STORE APP_DIR "/nas.txt"
+#endif
+#ifndef FORWARD_STORE
+#define FORWARD_STORE APP_DIR "/forward.txt"
 #endif
 
 static const struct http_backend g_backend = {.route = route, .info = info, .stop = stop};
@@ -213,8 +220,8 @@ static void run_network(void)
      * for. Two transfers at a time were slower, and were in use when an early build
      * powered the console off. */
     static const struct vnd_settings serving = {8, 1, VND_TX_BYTES};
-    /* Linux's aggregate size: nothing larger has been sent to an RTL8156B. */
-    static const struct vnd_settings serving_8156b = {8, 1, VND_LINUX_TX_BYTES};
+    /* Linux's aggregate size: nothing larger has been sent to an RTL8156B or RTL8157. */
+    static const struct vnd_settings serving_linux = {8, 1, VND_LINUX_TX_BYTES};
     char text[96];
 
     vnd_configure(&joining);
@@ -245,8 +252,9 @@ static void run_network(void)
     notify(text);
     files_set_log(log_file_line);
     smb_set_store(SMB_STORE);
+    say("NAS password key %s", secret_ready() ? "ready" : "unavailable");
     smb_client_use_adapter(1);
-    vnd_configure(g.chip == RTL_8156B ? &serving_8156b : &serving);
+    vnd_configure(g.chip == RTL_8159 ? &serving : &serving_linux);
     crash_stage("taking rights");
     if (tile_elevate() == 0) {
         files_sweep();
@@ -254,8 +262,11 @@ static void run_network(void)
         start_local_page();
         tile_resume();
     }
+    forward_set_store(FORWARD_STORE);
+    if (forward_start(g.lease.ip) != 0) say("port forwarding did not start");
     crash_stage("serving");
     if (net_serve(&g_backend, keep_going) != 0) say("the web server did not start: errno %d", errno);
+    forward_stop();
     files_stop();
     stop_local_page();
     net_stop();
@@ -408,7 +419,9 @@ static int run_native(void)
     notify("未找到可用的 USB 网卡，使用主机网络");
     files_set_log(log_file_line);
     smb_set_store(SMB_STORE);
+    say("NAS password key %s", secret_ready() ? "ready" : "unavailable");
     smb_client_use_adapter(0);
+    forward_set_store(FORWARD_STORE);   /* edited here, used with an adapter */
     crash_stage("taking rights");
     if (tile_elevate() == 0) files_sweep();
     if (listen_everywhere() != 0) {

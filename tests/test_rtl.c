@@ -19,7 +19,7 @@ static void codec(enum rtl_chip chip)
     assert(rtl_get_format(chip,&fmt)==0);
     memset(buf,0xa5,sizeof buf);
     assert(rtl_tx_encode(chip,f,2,buf,sizeof buf,&n)==0);
-    assert(!memcmp(buf,chip==RTL_8159?tx2:tx1,fmt.tx_header));
+    assert(!memcmp(buf,chip!=RTL_8156B?tx2:tx1,fmt.tx_header));
     aligned=(fmt.tx_header+61+fmt.tx_align-1)&~(fmt.tx_align-1);
     assert(n==aligned+fmt.tx_header+73);
     for(i=fmt.tx_header+61;i<aligned;i++) assert(buf[i]==0);
@@ -27,7 +27,7 @@ static void codec(enum rtl_chip chip)
     assert(v[0].len==61 && v[1].len==73 && !memcmp(v[1].data,b,73));
     for(i=0;i<2;i++) bridge[i]=(struct rtl_frame){v[i].data,v[i].len};
     assert(rtl_rx_fixture_encode(chip,bridge,2,rx,sizeof rx,&r)==0);
-    if(chip==RTL_8159) assert(rx[0]==0 && rx[1]==0 && rx[2]==0x82 && rx[3]==0);
+    if(chip!=RTL_8156B) assert(rx[0]==0 && rx[1]==0 && rx[2]==0x82 && rx[3]==0);
     else assert(rx[0]==65 && rx[1]==0);
     assert(rtl_rx_decode(chip,rx,r,v,2,&k)==0 && k==2);
     assert(v[0].len==61 && v[1].len==73 && !memcmp(v[0].data,a,61));
@@ -54,21 +54,21 @@ static void codec(enum rtl_chip chip)
     /* Reject offload profile, missing first/last flags, and v2 length/signature. */
     buf[3]^=0x80;assert(rtl_tx_decode(chip,buf,n,v,2,&k)==RTL_EFORMAT);buf[3]^=0x80;
     buf[4]=1;assert(rtl_tx_decode(chip,buf,n,v,2,&k)==RTL_EFORMAT);buf[4]=0;
-    if(chip==RTL_8159) {
+    if(chip!=RTL_8156B) {
         buf[8]^=1;assert(rtl_tx_decode(chip,buf,n,v,2,&k)==RTL_EFORMAT);buf[8]^=1;
         buf[15]^=1;assert(rtl_tx_decode(chip,buf,n,v,2,&k)==RTL_EFORMAT);buf[15]^=1;
     }
     /* Wrong chip layouts are rejected for these concrete fixtures. RX does not
      * carry an unambiguous chip signature; caller still selects trusted format. */
-    assert(rtl_tx_decode(chip==RTL_8159?RTL_8156B:RTL_8159,buf,n,v,2,&k)!=0);
-    assert(rtl_rx_decode(chip==RTL_8159?RTL_8156B:RTL_8159,rx,r,v,2,&k)!=0);
+    assert(rtl_tx_decode(chip!=RTL_8156B?RTL_8156B:RTL_8159,buf,n,v,2,&k)!=0);
+    assert(rtl_rx_decode(chip!=RTL_8156B?RTL_8156B:RTL_8159,rx,r,v,2,&k)!=0);
     /* VLAN metadata byte order differs; payload bytes are not silently tagged. */
-    if(chip==RTL_8159) { rx[0]|=8;put32(rx+4,0x23010000u); }
+    if(chip!=RTL_8156B) { rx[0]|=8;put32(rx+4,0x23010000u); }
     else put32(rx+4,0x00012301u);
     assert(rtl_rx_decode(chip,rx,r,v,2,&k)==0 && v[0].vlan_present && v[0].vlan_tci==0x123);
-    put32(rx,chip==RTL_8159?17u<<17:17u);
+    put32(rx,chip!=RTL_8156B?17u<<17:17u);
     assert(rtl_rx_decode(chip,rx,r,v,2,&k)==RTL_EFORMAT);
-    put32(rx,chip==RTL_8159?0x7fffu<<17:0x7fffu);
+    put32(rx,chip!=RTL_8156B?0x7fffu<<17:0x7fffu);
     assert(rtl_rx_decode(chip,rx,r,v,2,&k)==RTL_EFORMAT);
     memset(buf,0xa7,sizeof buf);memcpy(sentinel,buf,sizeof buf);
     assert(rtl_tx_encode(chip,f,2,buf,1,&n)==RTL_ENOSPC && n==0);
@@ -161,9 +161,12 @@ static void descriptors(void)
     assert(rtl_identify_target(&d,0x7020,&chip)==RTL_EUNSUPPORTED);
     assert(rtl_identify_target(&d,0x7030,&chip)==RTL_EUNSUPPORTED);
     assert(rtl_identify_target(&d,0x2020,&chip)==RTL_EUNSUPPORTED);
-    d.pid=0x815a;assert(rtl_identify_target(&d,0x2020,&chip)==0 && chip==RTL_8159);
+    d.pid=0x815a;assert(rtl_identify_target(&d,0x2020,&chip)==0 && chip!=RTL_8156B);
     d.vid=0x1234;assert(rtl_identify_target(&d,0x2020,&chip)==RTL_EUNSUPPORTED);
     d.vid=0xbda;d.pid=0x8159;assert(rtl_identify_target(&d,0x2020,&chip)==RTL_EUNSUPPORTED);
+    d.pid=0x8157;assert(rtl_identify_target(&d,0x1030,&chip)==0 && chip==RTL_8157);
+    assert(rtl_identify_target(&d,0x2020,&chip)==RTL_EUNSUPPORTED);
+    d.pid=0x815a;assert(rtl_identify_target(&d,0x1030,&chip)==RTL_EUNSUPPORTED);
     for(i=0;i<18;i++) assert(rtl_parse_device(dev,i,&d)!=0);
     assert(rtl_parse_config(cfg,sizeof cfg,0,0,&v)==0);
     assert(v.bulk_in==0x81 && v.bulk_out==2 && v.interrupt_in==0x83 && v.bulk_in_mps==1024);
@@ -284,7 +287,7 @@ int main(void)
 {
     struct rtl_format f;
     assert(rtl_get_format((enum rtl_chip)0,&f)==RTL_EUNSUPPORTED);
-    codec(RTL_8156B);codec(RTL_8159);crc_oracle();descriptors();vendor_helpers();valid_random();bounded_random();
+    codec(RTL_8156B);codec(RTL_8159);codec(RTL_8157);crc_oracle();descriptors();vendor_helpers();valid_random();bounded_random();
     puts("rtl codec: synthetic fixtures, descriptor validation, 20000 bounded random inputs OK");
     return 0;
 }

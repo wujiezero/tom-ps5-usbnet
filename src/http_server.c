@@ -51,6 +51,17 @@ static int respond(struct http_stream *stream, int status, const char *type, con
     return http_write_all(stream, body, size);
 }
 
+/* The tab and home-screen icon: the same PNG the console's tile shows. */
+static int respond_icon(struct http_stream *stream)
+{
+    char head[192];
+    int n = snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %u\r\n"
+        "Cache-Control: max-age=86400\r\nConnection: close\r\n\r\n", app_icon_length);
+
+    if (http_write_all(stream, head, (size_t)n) != 0) return -1;
+    return http_write_all(stream, app_icon, app_icon_length);
+}
+
 int http_respond(struct http_stream *stream, int status, const char *type, const char *body)
 {
     return respond(stream, status, type, body);
@@ -267,6 +278,7 @@ int http_serve(const struct http_backend *b, struct http_stream *stream)
     }
     if (!post) {
         if (!strcmp(q.path, "/")) return respond(stream, 200, "text/html; charset=utf-8", app_page);
+        if (!strcmp(q.path, "/icon.png") || !strcmp(q.path, "/favicon.ico")) return respond_icon(stream);
         if (!strcmp(q.path, "/api/info")) return respond_json(stream, b->info(b->context, json, sizeof json), json);
     } else if (!strcmp(q.path, "/api/exit")) {
         int result = respond_json(stream, 0, json);

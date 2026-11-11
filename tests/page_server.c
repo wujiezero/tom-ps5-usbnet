@@ -2,14 +2,17 @@
 /* Serves the page on 127.0.0.1, so that a real browser can walk all of it: only the page,
  * http_serve and the real file and NAS routes on folders (the NAS is smb_fake.c, its
  * shares the folders in the third argument, if given). No USB and no lwIP. Set
- * PAGE_NATIVE=1 for the page as it is without an adapter. */
+ * PAGE_NATIVE=1 for the page as it is without an adapter. Port forwarding runs on
+ * loopback, each rule's port moved up by 30000 (tests/forward_fake.c). */
 #include "files.h"
+#include "forward.h"
 #include "smb.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +20,16 @@
 #include <unistd.h>
 
 static int g_stop;
+
+void say(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
 
 static int info(void *c, char *out, size_t n)
 {
@@ -38,6 +51,8 @@ static int route(void *c, const struct http_request *r, struct http_stream *stre
     if (!strcmp(r->path, "/tile/status")) return http_respond(stream, 200, "application/json", "{\"state\":\"installed\",\"error\":\"\"}");
     if (!strcmp(r->path, "/tile/remove")) return http_respond(stream, 200, "application/json", "{\"state\":\"removed\",\"error\":\"\"}");
     if (!strcmp(r->path, "/tile/install")) return http_respond(stream, 200, "application/json", "{}");
+    result = forward_route(r, stream);
+    if (result != HTTP_NOT_MINE) return result;
     result = smb_route(r, stream);
     return result != HTTP_NOT_MINE ? result : files_route(r, stream);
 }
@@ -73,6 +88,13 @@ int main(int argc, char **argv)
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
     files_test_root = argv[2];
+    {
+        static char store[1024];
+
+        snprintf(store, sizeof store, "%s/../page-server-forward.txt", argv[2]);
+        forward_set_store(store);
+        if (!getenv("PAGE_NATIVE")) forward_start("192.0.2.50");
+    }
     if (argc > 3) {
         static char store[1024];
         extern const char *smb_fake_root;

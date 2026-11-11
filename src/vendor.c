@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* See vendor.h. The chip's own framing: one bulk transfer holds many frames, each after
- * a descriptor and on a boundary of the chip's (16 bytes and 16 on the RTL8159; 8 and 4
+ * a descriptor and on a boundary of the chip's (16 bytes and 16 on the RTL8157 and RTL8159; 8 and 4
  * going out, 24 and 8 coming in, on the RTL8156B), and USB sees one frame.
  *
  * Sending: frames are copied into the transfer being filled, which starts at once if

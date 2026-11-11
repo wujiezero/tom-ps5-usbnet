@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Runs the whole program on the host: real receive thread, lwIP and HTTP, against a
- * simulated ugen node, as an RTL8159 (no argument), as an RTL8156B ("8156b"), or with
+ * simulated ugen node, as an RTL8159 (no argument), as an RTL8156B ("8156b"), as an
+ * RTL8157 ("8157"), or with
  * no adapter at all ("none"), when the page is on the host's own loopback. The
  * simulated chip holds registers,
  * passes frames only once it has been brought up in the right order, refuses writes
@@ -10,6 +11,7 @@
 #include "vendor.h"
 #include "log.h"
 #include "mock_descriptors.h"
+#include "secret.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -28,6 +30,7 @@
 
 int app_main(void);
 int peer_main(int fd);
+void services_start(uint16_t echo, uint16_t ftp);
 
 #undef ioctl
 #undef open
@@ -266,7 +269,7 @@ static int vendor_read(struct usb_ctl_request *c)
     assert(c->ucr_request.bRequest == 0x05);
     memset(p, 0, length);
     if (which == PLA && address == 0xe908) {
-        put_le32(p, now() >= m.link_at ? (m.chip == RTL_8156B ? 0x00090483u : 0x00094083u) : 0);
+        put_le32(p, now() >= m.link_at ? (m.chip == RTL_8156B ? 0x00090483u : m.chip == RTL_8157 ? 0x00091083u : 0x00094083u) : 0);
     } else {
         for (i = 0; i < length / 4; i++) put_le32(p + 4 * i, *reg(which, address + 4 * i));
     }
@@ -299,7 +302,7 @@ static int on_the_list(unsigned which, unsigned dword)
         return listed(pla, sizeof pla / sizeof pla[0], dword) ||
             (m.chip == RTL_8156B && listed(pla_8156b, sizeof pla_8156b / sizeof pla_8156b[0], dword));
     return listed(usb, sizeof usb / sizeof usb[0], dword) ||
-        (m.chip == RTL_8159 ? listed(usb_8159, sizeof usb_8159 / sizeof usb_8159[0], dword) :
+        (m.chip != RTL_8156B ? listed(usb_8159, sizeof usb_8159 / sizeof usb_8159[0], dword) :
             listed(usb_8156b, sizeof usb_8156b / sizeof usb_8156b[0], dword));
 }
 
@@ -427,7 +430,7 @@ static int device_ioctl(unsigned long request, void *arg)
 
         memset(dd, 0, sizeof *dd);
         USETW(dd->idVendor, 0x0bda);
-        USETW(dd->idProduct, m.chip == RTL_8156B ? 0x8156 : 0x815a);
+        USETW(dd->idProduct, m.chip == RTL_8156B ? 0x8156 : m.chip == RTL_8157 ? 0x8157 : 0x815a);
         USETW(dd->bcdUSB, 0x0320);
         dd->bNumConfigurations = 3;
         return 0;
@@ -607,6 +610,13 @@ static void timed_out(int signo)
     _exit(124);
 }
 
+/* The host has no OpenPSID: a stand-in, so that a NAS password can be saved. */
+static int console_id(uint8_t id[16])
+{
+    memset(id, 0x5a, 16);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int cable[2], size = 1 << 20, status, code;
@@ -614,13 +624,15 @@ int main(int argc, char **argv)
     pid_t child;
 
     signal(SIGALRM, timed_out);
+    remove(FORWARD_STORE);              /* every run starts from the presets */
+    secret_set_source(console_id);
     alarm(120);
-    m.chip = argc > 1 && !strcmp(argv[1], "8156b") ? RTL_8156B : RTL_8159;
+    m.chip = argc > 1 && !strcmp(argv[1], "8156b") ? RTL_8156B : argc > 1 && !strcmp(argv[1], "8157") ? RTL_8157 : RTL_8159;
     snprintf(files_root, sizeof files_root, "/tmp/tom-usbnet-files-%d", (int)getpid());
     assert(mkdir(files_root, 0700) == 0);
     peer_files_root = files_test_root = files_root;
     if (argc > 1 && !strcmp(argv[1], "none")) return run_without_adapter(files_root);
-    peer_link_mbps = m.chip == RTL_8156B ? 2500 : 10000;
+    peer_link_mbps = m.chip == RTL_8156B ? 2500 : m.chip == RTL_8157 ? 5000 : 10000;
     assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, cable) == 0);
     setsockopt(cable[0], SOL_SOCKET, SO_SNDBUF, &size, sizeof size);
     setsockopt(cable[1], SOL_SOCKET, SO_SNDBUF, &size, sizeof size);
@@ -633,19 +645,22 @@ int main(int argc, char **argv)
         _exit(peer_main(cable[1]));
     }
     close(cable[1]);
+    services_start(19201, 19203);       /* what peer.c reaches through the forwarded ports */
     pthread_mutex_init(&m.lock, NULL);
     pthread_cond_init(&m.changed, NULL);
     m.cable = cable[0];
     m.config = 0;
     /* As read from the chip in the vendor configuration, and the adapter's own address.
-     * PLA_TCR0's top half is the version: 0x2020 for the RTL8159, 0x7410 for the RTL8156B. */
+     * PLA_TCR0's top half is the version: 0x2020 for the RTL8159, 0x1030 for the RTL8157,
+     * 0x7410 for the RTL8156B. USB_CTRL starts with bit 11 set, which only the RTL8159's
+     * path clears. */
     *reg(PLA, 0xc000) = 0xccbbaa02u;
     *reg(PLA, 0xc004) = 0x0000eeddu;
     *reg(PLA, 0xc010) = 0x0402480fu;
     *reg(PLA, 0xe004) = 0x00000002u;
-    *reg(PLA, 0xe610) = m.chip == RTL_8156B ? 0x74100800u : 0x23200800u;
+    *reg(PLA, 0xe610) = m.chip == RTL_8156B ? 0x74100800u : m.chip == RTL_8157 ? 0x10300800u : 0x23200800u;
     *reg(PLA, 0xe858) = 0x02000000u;
-    *reg(USB, 0xd404) = 0x00402e00u;
+    *reg(USB, 0xd404) = 0x08402e00u;
     *reg(USB, 0xd40c) = 0x00600400u;
     *reg(USB, 0xd4b0) = 0x000300ffu;
     pthread_create(&m.receiver, NULL, receiver, NULL);
@@ -661,12 +676,19 @@ int main(int argc, char **argv)
         assert(strstr(report, "chip RTL8156B, version 0x7410"));
         assert(strstr(report, "link up, 2500 Mbit/s"));
         assert(m.resets == 1);
+    } else if (m.chip == RTL_8157) {
+        assert(strstr(report, "chip RTL8157, version 0x1030"));
+        assert(strstr(report, "link up, 5000 Mbit/s"));
+        assert(m.resets == 0 && (*reg(USB, 0xd404) & 0x08000000u));
+        assert((*reg(USB, 0xd42c) >> 16) == (32 * 1024 - 1522 - 32) / 16);   /* the early size */
     } else {
         assert(strstr(report, "chip RTL8159, version 0x2020"));
         assert(strstr(report, "link up, 10000 Mbit/s"));
-        assert(m.resets == 0);
+        assert(m.resets == 0 && !(*reg(USB, 0xd404) & 0x08000000u));
     }
     assert(strstr(report, "address from dhcp"));
+    assert(strstr(report, "NAS password key ready"));
+    assert(strstr(report, "forward: 11 rules, 11 on") && strstr(report, "forward: 2 rules saved"));
     assert(strstr(console, "http://192.0.2.50/"));
     assert(!strstr(report, "192.0.2.50"));              /* the address stays out of the file */
     assert(strstr(report, ": 17825799 bytes in"));
@@ -681,6 +703,6 @@ int main(int argc, char **argv)
     assert(m.fs_uninit == 1 && m.configs_seen[2] == 1 && m.configs_seen[0] == 1 && m.config == 0 && m.alt == 0);
     assert(tile_calls[0] == 1 && tile_calls[1] == 1);
     assert(rmdir(files_root) == 0);     /* the peer deleted what it uploaded */
-    printf("end-to-end test passed: %s\n", m.chip == RTL_8156B ? "RTL8156B" : "RTL8159");
+    printf("end-to-end test passed: %s\n", m.chip == RTL_8156B ? "RTL8156B" : m.chip == RTL_8157 ? "RTL8157" : "RTL8159");
     return 0;
 }

@@ -79,6 +79,9 @@ unsigned int un_port_rand(void);
 #undef TCP_LISTEN_BACKLOG
 #undef DEFAULT_TCP_RECVMBOX_SIZE
 #undef LWIP_STATS
+#undef MEMP_NUM_TCP_PCB
+#undef MEMP_NUM_TCP_PCB_LISTEN
+#undef MEMP_NUM_NETCONN
 #define LWIP_UDP 1
 #define LWIP_DHCP 1
 #define LWIP_AUTOIP 1
@@ -105,6 +108,11 @@ extern unsigned char *net_heap;
 #define LWIP_TCP_RTO_TIME 1000
 #define TCP_SNDLOWAT (32 * 1024)
 #define TCP_LISTEN_BACKLOG 1
+/* The page, up to 32 forwarded ports and 16 FTP data ports listening, and the
+ * connections of all of them (src/forward.c). */
+#define MEMP_NUM_TCP_PCB 192
+#define MEMP_NUM_TCP_PCB_LISTEN 64
+#define MEMP_NUM_NETCONN 256
 #define DEFAULT_TCP_RECVMBOX_SIZE 4096
 #define LWIP_TCP_SACK_OUT 1
 #define LWIP_CHECKSUM_ON_COPY 1

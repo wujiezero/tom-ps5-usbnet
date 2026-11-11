@@ -10,6 +10,7 @@ A build alone is not evidence that it runs.
 import argparse
 import hashlib
 import json
+import re
 import os
 import shutil
 import struct
@@ -20,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ["src/main.c", "src/adapter.c", "src/log.c", "src/vendor.c", "src/vendor_regs.c", "src/net.c", "src/http_server.c",
            "src/app_assets.c", "src/files.c", "src/tile.c", "src/crash.c", "src/local_http.c", "src/ncm.c", "src/rtl.c", "src/smb.c", "src/smb_client.c", "src/smb_net.c",
-           "src/smb_lwip.c", "port/sys_arch.c"]
+           "src/smb_lwip.c", "src/secret.c", "src/forward.c", "src/forward_lwip.c", "port/sys_arch.c"]
 LWIP_DIRECTORIES = ["third_party/lwip/src/core", "third_party/lwip/src/core/ipv4", "third_party/lwip/src/api"]
 FLAGS = ["-DUN_COND_REALTIME", "-Iport", "-Ithird_party/lwip/src/include"]
 # libsmb2 is third-party: no -Werror. Its socket calls go to src/smb_net.c (include/smb_sock.h).
@@ -194,7 +195,7 @@ def main():
     zig_include = str(zig / "lib/include")
 
     compiled = []
-    sources = [(source, ["-Wall", "-Wextra", "-Werror", "-Ithird_party/libsmb2/include"]) for source in SOURCES]
+    sources = [(source, ["-Wall", "-Wextra", "-Werror", "-Ithird_party/libsmb2/include", "-Ithird_party/libsmb2/lib"]) for source in SOURCES]
     pinned_input("lwip", "third_party/lwip", "85a09ebe68c260d4876e800220588e5a0b624266c994cc25da978210c2813f14")
     for directory in LWIP_DIRECTORIES:
         sources += [(str(path.relative_to(ROOT)), []) for path in sorted((ROOT / directory).glob("*.c"))]
@@ -222,6 +223,12 @@ def main():
         ["--hash-style=gnu"], environment)
 
     summary = elf_summary(output)
+    # The page shows APP_VERSION (/api/info), so the package and the page agree by
+    # construction; this only checks that the build picked it up.
+    version = re.search(r'#define APP_VERSION "([^"]+)"', (ROOT / "include/log.h").read_text()).group(1)
+    if f'"version":"{version}"'.encode() not in output.read_bytes():
+        raise SystemExit(f"APP_VERSION {version} is not in the build")
+    summary["version"] = version
     print(json.dumps(summary, indent=2))
 
 

@@ -7,6 +7,8 @@ static uint32_t le32(const uint8_t *p)
 { return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24; }
 static void put32(uint8_t *p, uint32_t v)
 { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); }
+/* The RTL8157 and RTL8159 format: 16-byte descriptors on both sides. */
+static int v2(enum rtl_chip chip) { return chip==RTL_8159 || chip==RTL_8157; }
 static int align_size(size_t n, size_t a, size_t *v)
 {
     if (n > SIZE_MAX-(a-1)) return RTL_EINVAL;
@@ -16,7 +18,7 @@ int rtl_get_format(enum rtl_chip chip, struct rtl_format *out)
 {
     if (!out) return RTL_EINVAL;
     if (chip==RTL_8156B) *out=(struct rtl_format){24,8,8,4};
-    else if (chip==RTL_8159) *out=(struct rtl_format){16,16,16,16};
+    else if (v2(chip)) *out=(struct rtl_format){16,16,16,16};
     else return RTL_EUNSUPPORTED;
     return 0;
 }
@@ -56,10 +58,10 @@ static int encode(enum rtl_chip chip, const struct rtl_frame *frames,
         n=frames[i].len;
         if (!rx && n<60) n=60;
         wire=n+(rx?4u:0u);
-        if (rx) put32(out+start,chip==RTL_8159?(uint32_t)wire<<17:(uint32_t)wire);
+        if (rx) put32(out+start,v2(chip)?(uint32_t)wire<<17:(uint32_t)wire);
         else {
             put32(out+start,0xc0000000u|(uint32_t)n);
-            if (chip==RTL_8159) {
+            if (v2(chip)) {
                 put32(out+start+8,(uint32_t)n<<4);
                 put32(out+start+12,0xa8000000u);
             }
@@ -88,14 +90,14 @@ static int walk(enum rtl_chip chip,const uint8_t *data,size_t len,
         if (len-off<h) return RTL_ETRUNC;
         w=le32(data+off);
         if (rx) {
-            n=chip==RTL_8159?(w>>17):(w&0x7fffu);
+            n=v2(chip)?(w>>17):(w&0x7fffu);
             /* All-ones is treated as invalid by the FreeBSD reference. */
             if (n==0x7fff || n<18 || n>RTL_MAX_FRAME+4u) return RTL_EFORMAT;
         } else {
             n=w&0x3ffffu;
             if ((w&~0x3ffffu)!=0xc0000000u || le32(data+off+4)!=0 ||
                 n<60 || n>RTL_MAX_FRAME) return RTL_EFORMAT;
-            if (chip==RTL_8159 &&
+            if (v2(chip) &&
                 (le32(data+off+8)!=(uint32_t)n<<4 ||
                  le32(data+off+12)!=0xa8000000u)) return RTL_EFORMAT;
         }
@@ -108,8 +110,8 @@ static int walk(enum rtl_chip chip,const uint8_t *data,size_t len,
             for (j=0;j<h/4;j++) v->status[j]=le32(data+off+j*4);
             if (rx) {
                 uint32_t flags=le32(data+off+4);
-                v->vlan_present=(uint8_t)(chip==RTL_8159?!!(w&8u):!!(flags&0x10000u));
-                if (chip==RTL_8159) flags>>=16;
+                v->vlan_present=(uint8_t)(v2(chip)?!!(w&8u):!!(flags&0x10000u));
+                if (v2(chip)) flags>>=16;
                 v->vlan_tci=(uint16_t)((flags&255u)<<8 | ((flags>>8)&255u));
                 if (!v->vlan_present) v->vlan_tci=0;
             }
@@ -158,8 +160,10 @@ int rtl_identify_target(const struct rtl_usb_device *d,uint16_t ver,
     if (!d || !out) return RTL_EINVAL;
     ver&=0x7cf0u;
     if (d->vid!=0x0bda) return RTL_EUNSUPPORTED;
-    /* RTL_VER_12, 13 and 15 in Linux's r8152; 0x7020/0x7030, the first RTL8156, are not. */
+    /* RTL_VER_12, 13 and 15 in Linux's r8152; 0x7020/0x7030, the first RTL8156, are not.
+     * RTL_VER_16 is the RTL8157, RTL_VER_17 the RTL8159. */
     if (d->pid==0x8156 && (ver==0x7400 || ver==0x7410 || ver==0x7420)) *out=RTL_8156B;
+    else if (d->pid==0x8157 && ver==0x1030) *out=RTL_8157;
     else if (d->pid==0x815a && ver==0x2020) *out=RTL_8159;
     else return RTL_EUNSUPPORTED;
     return 0;
@@ -231,7 +235,7 @@ int rtl_tx_header(enum rtl_chip chip,uint8_t *h,size_t len)
     if (!h || len<60 || len>RTL_MAX_FRAME || rtl_get_format(chip,&f)) return RTL_EINVAL;
     put32(h,0xc0000000u|(uint32_t)len);
     put32(h+4,0);
-    if (chip==RTL_8159) {
+    if (v2(chip)) {
         put32(h+8,(uint32_t)len<<4);
         put32(h+12,0xa8000000u);
     }
@@ -245,12 +249,12 @@ int rtl_rx_scan(enum rtl_chip chip,const uint8_t *d,size_t len,struct rtl_frame_
     if (!count) return RTL_EINVAL;
     *count=0;
     if (!d || (!views && cap) || rtl_get_format(chip,&f)) return RTL_EINVAL;
-    h=f.rx_header; a=f.rx_align; least=chip==RTL_8159?18u:60u;
+    h=f.rx_header; a=f.rx_align; least=v2(chip)?18u:60u;
     while (off<len) {
         struct rtl_frame_view *v;
         if (len-off<h) return RTL_ETRUNC;
         w=le32(d+off);
-        wire=chip==RTL_8159?w>>17:(w&0x7fffu);
+        wire=v2(chip)?w>>17:(w&0x7fffu);
         if (wire<least || wire>RTL_MAX_FRAME+4u) return RTL_EFORMAT;
         if (wire>len-off-h) return RTL_ETRUNC;
         if (n==cap) return RTL_ENOSPC;
