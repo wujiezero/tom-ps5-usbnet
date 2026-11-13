@@ -22,7 +22,7 @@ struct memory {
 };
 
 static char g_root[256];
-static int g_lines, g_saw_name, g_saw_upload;
+static int g_lines, g_saw_name, g_saw_upload, g_saw_pace;
 
 static ssize_t memory_read(void *context, void *data, size_t length)
 {
@@ -430,11 +430,14 @@ static void noted_upload(void)
     char url[4096], *body = NULL;
 
     CHECK(data);
+    files_test_sample_ms = 0;           /* every block but the last */
     target(url, sizeof url, "/fs/put", "path", "/b/secret-name.bin");
     CHECK(request_full("POST", url, data, size, size, NULL, &body, &length) == 200);
     free(body);
     free(data);
+    files_test_sample_ms = 30000;
     CHECK(g_saw_upload && !g_saw_name);
+    CHECK(g_saw_pace >= 1 && g_saw_pace <= 16);
 }
 
 /* What every page's poll sees. */
@@ -561,6 +564,7 @@ static void note(const char *line)
 {
     if (strstr(line, "secret-name")) g_saw_name = 1;
     if (strstr(line, "upload ") && strstr(line, "closing fsync")) g_saw_upload = 1;
+    if (strstr(line, "upload ") && strstr(line, " GiB: ") && strstr(line, "disk ") && strstr(line, "slowest write ")) g_saw_pace++;
     g_lines++;
 }
 

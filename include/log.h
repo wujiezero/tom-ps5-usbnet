@@ -5,10 +5,10 @@
 #include <stdint.h>
 
 /* The run log: APP_DIR/log.txt, with the previous run's in log.old.txt. Lines also go
- * to the ELF loader's socket. Never a serial number, a MAC address, a LAN address or a
+ * to the ELF loader's socket. Each starts with the seconds since the log was opened. Never a serial number, a MAC address, a LAN address or a
  * file's name: console_line() is for what only the person at the loader should see. */
 #define APP_NAME "tom-ps5-usbnet"
-#define APP_VERSION "0.3.0"
+#define APP_VERSION "0.3.1"
 #define APP_DIR "/data/" APP_NAME
 
 int log_open(void);

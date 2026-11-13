@@ -40,6 +40,7 @@
 #define MAX_TRANSFERS 12
 #define TRANSFER_KEEP_MS 15000L         /* how long the other pages still see a finished one */
 #define CLIENT_BYTES 17
+#define SAMPLE_MS 30000L                /* how often a long upload says how it is going */
 #ifdef FILES_TESTING
 #define BENCH_MIB 16
 #else
@@ -55,6 +56,9 @@ static void (*g_log)(const char *);
 
 #ifdef FILES_TESTING
 const char *files_test_root;
+long files_test_sample_ms = SAMPLE_MS;
+#undef SAMPLE_MS
+#define SAMPLE_MS files_test_sample_ms
 #endif
 
 static struct {
@@ -88,6 +92,14 @@ static long now_ms(void)
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static long long now_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
 void files_set_log(void (*log)(const char *line))
@@ -586,13 +598,37 @@ static int transfers(struct http_stream *stream)
 
 /* ---- upload ---------------------------------------------------------------- */
 
+/* Where an upload's time went since the last line about it: waiting for the network to
+ * fill a block, or for the disk to take one. A write only waits once the cache is full,
+ * so a disk that cannot keep up shows as the disk's share growing. */
+struct pace {
+    long long since, read_us, write_us, slowest_read, slowest_write;
+    uint64_t bytes;
+};
+
+static void say_pace(const char *path, uint64_t total, struct pace *p, long long now)
+{
+    long long us = now - p->since, busy = p->read_us + p->write_us;
+    char line[224];
+
+    if (g_log && us > 0 && busy > 0) {
+        snprintf(line, sizeof line, "upload %.*s at %.1f GiB: %" PRIu64 " MB/s over %lld s, disk %lld%%, network %lld%%, slowest write %lld ms, "
+            "slowest read %lld ms", (int)root_length(path), path, (double)total / (1024.0 * 1024 * 1024), p->bytes / (uint64_t)us,
+            (us + 500000) / 1000000, p->write_us * 100 / busy, p->read_us * 100 / busy, p->slowest_write / 1000, p->slowest_read / 1000);
+        g_log(line);
+    }
+    memset(p, 0, sizeof *p);
+    p->since = now;
+}
+
 /* Whole blocks to the disk, not whatever one read returned: what arrived with the head
  * starts the first block, so every write but the last is IO_BYTES at a multiple of it. */
-static int receive(const struct http_request *r, struct http_stream *stream, int fd, uint64_t *total, struct transfer *t)
+static int receive(const struct http_request *r, struct http_stream *stream, int fd, uint64_t *total, struct transfer *t, const char *path)
 {
     uint8_t *buffer = malloc(IO_BYTES);
     uint64_t want = r->length;
     size_t have = r->body_length < want ? r->body_length : (size_t)want;
+    struct pace pace = {0};
     int failed = 0;
 
     if (!buffer) {
@@ -600,8 +636,10 @@ static int receive(const struct http_request *r, struct http_stream *stream, int
         return -1;
     }
     if (have) memcpy(buffer, r->body, have);
+    pace.since = now_us();
     while (*total < want && !failed) {
         size_t room = want - *total < IO_BYTES ? (size_t)(want - *total) : IO_BYTES;
+        long long before = now_us(), between, after;
 
         while (have < room) {
             ssize_t n = stream->read(stream->context, buffer + have, room - have);
@@ -613,9 +651,17 @@ static int receive(const struct http_request *r, struct http_stream *stream, int
             }
             have += (size_t)n;
         }
+        between = now_us();
         if (have && write(fd, buffer, have) != (ssize_t)have) failed = 1;
+        after = now_us();
         *total += have;
         transfer_add(t, have);
+        pace.bytes += have;
+        pace.read_us += between - before;
+        pace.write_us += after - between;
+        if (between - before > pace.slowest_read) pace.slowest_read = between - before;
+        if (after - between > pace.slowest_write) pace.slowest_write = after - between;
+        if (after - pace.since >= SAMPLE_MS * 1000LL && *total < want && !failed) say_pace(path, *total, &pace, after);
         have = 0;
     }
     free(buffer);
@@ -647,7 +693,7 @@ static int upload(const struct http_request *r, struct http_stream *stream)
     if (fd < 0) return fail(stream);
     client_of(r, client);
     t = transfer_begin("upload", path, client, r->length);
-    if (receive(r, stream, fd, &total, t) != 0) {
+    if (receive(r, stream, fd, &total, t, path) != 0) {
         code = errno;
         close(fd);
         unlink(part);

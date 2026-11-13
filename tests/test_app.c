@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Runs the whole program on the host: real receive thread, lwIP and HTTP, against a
  * simulated ugen node, as an RTL8159 (no argument), as an RTL8156B ("8156b"), as an
- * RTL8157 ("8157"), or with
+ * RTL8157 ("8157"), as an RTL8159 whose bulk OUT stops working for good ("lost"), or with
  * no adapter at all ("none"), when the page is on the host's own loopback. The
  * simulated chip holds registers,
  * passes frames only once it has been brought up in the right order, refuses writes
@@ -50,6 +50,8 @@ void services_start(uint16_t echo, uint16_t ftp);
 #define PLA 1
 #define USB 0
 #define MAX_AGGREGATE 40
+#define FAIL_OUT_AT 300                 /* which bulk OUT fails as a transaction error would */
+#define USB_ERR_IOERROR_STATUS 18
 #define FRAME_BYTES 2048
 
 static struct {
@@ -65,6 +67,7 @@ static struct {
     unsigned long rx_dropped, aggregates, largest, multi_frame_transfers, writes;
     uint32_t regs[2][0x4000], bmu;
     int configs_seen[4], fs_uninit, resets, absent;
+    int out_starts, out_reset_due, out_resets, out_dead, out_failed;
     enum rtl_chip chip;
     long link_at;
     pthread_t receiver;
@@ -197,7 +200,11 @@ static void send_aggregate(int i)
     uint32_t length = ep->pLength[0];
 
     assert(chip_running() || (*reg(PLA, 0xe810) >> 24 & 0x04));
-    assert(ep->nFrames == 1 && ep->flags == 0 && ep->timeout > 0 && length <= m.bufsize[i]);
+    /* The transfer after a failed one resets the endpoint, and only that one. */
+    assert(ep->flags == (m.out_reset_due ? USB_FS_FLAG_CLEAR_STALL : 0));
+    m.out_resets += m.out_reset_due;
+    m.out_reset_due = 0;
+    assert(ep->nFrames == 1 && ep->timeout > 0 && length <= m.bufsize[i]);
     assert(rtl_tx_decode(m.chip, ep->ppBuffer[0], length, views, 800, &count) == 0 && count >= 1);
     if (count > 1) m.multi_frame_transfers++;
     for (k = 0; k < count; k++) {
@@ -405,7 +412,18 @@ static int fs_start(const struct usb_fs_start *start)
 
     assert(m.fs_active && m.opened[i]);
     if (m.ep_no[i] == 0x02) {
-        send_aggregate(i);
+        if (++m.out_starts == FAIL_OUT_AT || (m.out_dead && m.out_starts > FAIL_OUT_AT)) {
+            /* Every try after a failure comes with the reset. */
+            assert(m.ep[i].flags == (m.out_reset_due ? USB_FS_FLAG_CLEAR_STALL : 0));
+            m.out_failed++;
+            m.ep[i].aFrames = 0;
+            m.ep[i].status = USB_ERR_IOERROR_STATUS;
+            m.done[m.done_count++] = i;
+            m.out_reset_due = 1;
+            pthread_cond_broadcast(&m.changed);
+        } else {
+            send_aggregate(i);
+        }
     } else {
         assert(m.ep[i].nFrames == 1 && m.ep[i].flags == USB_FS_FLAG_SINGLE_SHORT_OK && m.ep[i].pLength[0] == VND_RX_BYTES);
         m.rx_queue[m.rx_count++] = i;
@@ -628,6 +646,7 @@ int main(int argc, char **argv)
     secret_set_source(console_id);
     alarm(120);
     m.chip = argc > 1 && !strcmp(argv[1], "8156b") ? RTL_8156B : argc > 1 && !strcmp(argv[1], "8157") ? RTL_8157 : RTL_8159;
+    m.out_dead = argc > 1 && !strcmp(argv[1], "lost");
     snprintf(files_root, sizeof files_root, "/tmp/tom-usbnet-files-%d", (int)getpid());
     assert(mkdir(files_root, 0700) == 0);
     peer_files_root = files_test_root = files_root;
@@ -668,6 +687,19 @@ int main(int argc, char **argv)
     pthread_mutex_lock(&m.lock);
     m.stop = 1;
     pthread_mutex_unlock(&m.lock);
+    if (m.out_dead) {
+        /* Nothing more goes out: the run ends by itself, says why, and leaves the adapter
+         * alone, as it would one that is no longer there. */
+        kill(child, SIGKILL);
+        assert(waitpid(child, &status, 0) == child);
+        fputs(report, stderr);
+        assert(code == 0 && m.out_failed >= 8 && m.out_resets == 0);
+        assert(strstr(report, "bulk OUT status: 18, 8 so far") && strstr(report, "adapter lost: bulk OUT failures in a row"));
+        assert(strstr(report, "serving ended: the adapter was lost") && !strstr(report, "bulk OUT works again"));
+        assert(strstr(last_notify, "失联") && m.fs_uninit == 0 && m.config == 0);
+        puts("end-to-end test passed: bulk OUT lost");
+        return 0;
+    }
     assert(waitpid(child, &status, 0) == child);
     fputs(report, stderr);
     assert(code == 0);
@@ -687,6 +719,12 @@ int main(int argc, char **argv)
         assert(m.resets == 0 && !(*reg(USB, 0xd404) & 0x08000000u));
     }
     assert(strstr(report, "address from dhcp"));
+    /* One bulk OUT failed: it is said, the endpoint is reset once, and the run goes on. */
+    assert(m.out_starts > FAIL_OUT_AT && m.out_resets == 1);
+    assert(strstr(report, "bulk OUT status: 18") && strstr(report, "bulk OUT works again after 1 failures"));
+    assert(strstr(report, " ok, 1 failed; in ") && !strstr(report, "adapter lost"));
+    assert(strstr(report, "chip counters: rx ") && strstr(report, "serving ended: asked to stop"));
+    assert(!strstr(report, "link status unreadable") && !strstr(report, "link down"));
     assert(strstr(report, "NAS password key ready"));
     assert(strstr(report, "forward: 11 rules, 11 on") && strstr(report, "forward: 2 rules saved"));
     assert(strstr(console, "http://192.0.2.50/"));

@@ -38,6 +38,7 @@
 #define ADDRESS_WAIT_MS 40000L
 #define LINK_SETTLE_US 1000000
 #define LINK_POLL_MS 1000L
+#define LINK_READ_TRIES 3               /* status reads that fail in a row before the link counts as down */
 #define LOCAL_RETRY_S 5
 #define CONFIG_BYTES 2048
 #define NATIVE_TICK_US 250000
@@ -130,21 +131,48 @@ static int route(void *context, const struct http_request *request, struct http_
 
 static const struct http_backend g_backend = {.route = route, .info = info, .stop = stop};
 
-/* There is no link notification in use: the MAC's status register is enough. */
+/* There is no link notification in use: the MAC's status register is enough. A read
+ * that fails is the chip not answering over USB, which is not the cable: it is said as
+ * what it is, and only counts as no link once it lasts. */
 static void watch_link(long t)
 {
     static long last_poll;
-    uint16_t status;
+    static int unreadable;
+    uint16_t status = 0;
+    unsigned mbps;
     int up;
 
     if (t - last_poll < LINK_POLL_MS) return;
     last_poll = t;
-    status = vnd_regs_phy_status();
+    if (vnd_regs_read_phy(&status) != 0) {
+        if (!unreadable++) {
+            say("link status unreadable, errno %d", errno);
+            checkpoint();
+        }
+        if (unreadable < LINK_READ_TRIES) return;
+        status = 0;
+    } else if (unreadable) {
+        say("link status readable again after %d failed reads", unreadable);
+        unreadable = 0;
+    }
     up = rtl_phy_link(status);
-    if (up) g.link_mbps = rtl_phy_mbps(status);
-    if (up == g.link_up) return;
+    mbps = rtl_phy_mbps(status);
+    if (up == g.link_up) {
+        if (up && mbps != g.link_mbps) {
+            say("link now %u Mbit/s, was %u", mbps, g.link_mbps);
+            g.link_mbps = mbps;
+            checkpoint();
+        }
+        return;
+    }
     g.link_up = up;
-    say("link %s", up ? "up" : "down");
+    if (up) {
+        g.link_mbps = mbps;
+        say("link up, %u Mbit/s", mbps);
+        if (vnd_regs_enabled() == 0) say("the MAC is no longer enabled: the chip reset itself, replug the adapter");
+    } else {
+        say("link down");
+    }
     vnd_regs_mark_link(up);
     net_link(up);
     checkpoint();
@@ -266,6 +294,8 @@ static void run_network(void)
     if (forward_start(g.lease.ip) != 0) say("port forwarding did not start");
     crash_stage("serving");
     if (net_serve(&g_backend, keep_going) != 0) say("the web server did not start: errno %d", errno);
+    else say("serving ended: %s", vnd_gone() ? "the adapter was lost" : "asked to stop");
+    checkpoint();
     forward_stop();
     files_stop();
     stop_local_page();
@@ -468,7 +498,7 @@ int main(void)
     if (result == ADAPTER_NONE) result = run_native();
     say("stopped");
     checkpoint();
-    notify(result || g.native ? "已退出" : "已退出，网卡已恢复");
+    notify(result || g.native ? "已退出" : adapter_gone ? "网卡失联，已退出，请重新插拔网卡" : "已退出，网卡已恢复");
     log_close();
     return result;
 }

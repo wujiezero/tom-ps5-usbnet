@@ -9,7 +9,12 @@
  *
  * Receiving: every pending transfer is VND_RX_BYTES long, the size Linux uses, and
  * how much the chip puts in one is set at bring-up. That never exceeds the transfer, so
- * an aggregate always ends with its transfer. */
+ * an aggregate always ends with its transfer.
+ *
+ * Failures: each kind is counted on its own and the totals are said when the run ends.
+ * A bulk OUT that fails for any reason has the endpoint reset before the next one goes,
+ * since a host controller halts an endpoint on a transaction error as it does on a
+ * stall. If they keep failing the adapter counts as lost. */
 #include "adapter.h"
 #include "log.h"
 #include "vendor.h"
@@ -33,8 +38,14 @@
 #define POLL_MS 20
 #define THREAD_STACK (1024 * 1024)
 #define MAX_RX_ERRORS 1000
-#define MAX_LOGGED 8
+#define MAX_LOGGED 4                    /* of each kind; after that, every time the count doubles */
 #define USB_STATUS_STALLED 22
+#define TX_DEAD_FAILURES 8              /* in a row, and for this long, with none getting through */
+#define TX_DEAD_MS 5000LL
+
+enum { ERR_OUT, ERR_IN, ERR_START, ERR_COMPLETE, ERR_SCAN, ERR_KINDS };
+static const char *const g_error_names[ERR_KINDS] = {"bulk OUT status", "bulk IN status", "USB_FS_START errno", "USB_FS_COMPLETE errno",
+    "bulk IN aggregate cut short"};
 
 static size_t g_tx_align = 16, g_tx_header = 16;
 static enum rtl_chip g_chip = RTL_8159;
@@ -64,7 +75,11 @@ static struct {
     int rx_pending, done[VND_MAX_RX], done_count;
     struct tx_transfer tx[TX_TRANSFERS];
     int fill, outstanding;
-    unsigned logged, rx_errors;
+    int tx_reset;                       /* the next bulk OUT resets the endpoint first */
+    unsigned tx_failed_run;
+    long long tx_failed_since;
+    unsigned rx_errors;
+    unsigned long errors[ERR_KINDS], tx_done, rx_done;
 } g;
 
 void vnd_lock(void)
@@ -90,9 +105,21 @@ static int dead_errno(int code)
     return code == ENXIO || code == ENODEV || code == EIO || code == EBADF || code == ENOENT;
 }
 
-static void note_error(const char *what, int value)
+/* One kind filling the log must not hide another, and a failure that goes on for an hour
+ * must still show when it began and how fast it grew. */
+static void note_error(int kind, int value)
 {
-    if (g.logged++ < MAX_LOGGED) say("%s: %d", what, value);
+    unsigned long n = ++g.errors[kind];
+
+    if (n <= MAX_LOGGED) say("%s: %d", g_error_names[kind], value);
+    else if (!(n & (n - 1))) say("%s: %d, %lu so far", g_error_names[kind], value, n);
+}
+
+static void lose(const char *why, int value)
+{
+    if (g.gone) return;
+    g.gone = 1;
+    say("adapter lost: %s %d", why, value);
 }
 
 /* ---- transfers: the lock is held ----------------------------------------- */
@@ -100,12 +127,14 @@ static void note_error(const char *what, int value)
 static int start_endpoint(int index)
 {
     struct usb_fs_start start;
+    int code;
 
     memset(&start, 0, sizeof start);
     start.ep_index = (uint8_t)index;
     if (ioctl(g.fd, USB_FS_START, &start) == 0) return 0;
-    if (dead_errno(errno)) g.gone = 1;
-    note_error("USB_FS_START errno", errno);
+    code = errno;
+    note_error(ERR_START, code);
+    if (dead_errno(code)) lose("USB_FS_START errno", code);
     return -1;
 }
 
@@ -129,6 +158,7 @@ static void launch(void)
     struct usb_fs_endpoint *ep;
 
     if (g.fill < 0 || g.outstanding >= g.set.queue) return;
+    if (g.tx_reset && g.outstanding) return;    /* the endpoint is reset with nothing else on it */
     t = &g.tx[g.fill];
     if (!t->frames) return;
     ep = &g_endpoints[EP_TX0 + g.fill];
@@ -136,11 +166,14 @@ static void launch(void)
     ep->nFrames = 1;
     ep->aFrames = 0;
     ep->status = 0;
+    if (g.tx_reset) ep->flags |= USB_FS_FLAG_CLEAR_STALL;
+    else ep->flags &= (uint8_t)~USB_FS_FLAG_CLEAR_STALL;
     if (start_endpoint(EP_TX0 + g.fill) != 0) {
         t->frames = 0;
         t->used = 0;
         return;
     }
+    g.tx_reset = 0;
     t->busy = 1;
     g.outstanding++;
     g.fill = -1;
@@ -151,10 +184,15 @@ static void finish_tx(int i, unsigned status)
     struct tx_transfer *t = &g.tx[i];
 
     if (status) {
-        note_error("bulk OUT status", (int)status);
-        if (status == USB_STATUS_STALLED) g_endpoints[EP_TX0 + i].flags |= USB_FS_FLAG_CLEAR_STALL;
+        note_error(ERR_OUT, (int)status);
+        g.tx_reset = 1;
+        if (!g.tx_failed_run++) g.tx_failed_since = now_ns();
+        else if (g.tx_failed_run >= TX_DEAD_FAILURES && now_ns() - g.tx_failed_since >= TX_DEAD_MS * 1000000LL)
+            lose("bulk OUT failures in a row:", (int)g.tx_failed_run);
     } else {
-        g_endpoints[EP_TX0 + i].flags &= (uint8_t)~USB_FS_FLAG_CLEAR_STALL;
+        if (g.tx_failed_run) say("bulk OUT works again after %u failures", g.tx_failed_run);
+        g.tx_failed_run = 0;
+        g.tx_done++;
     }
     t->busy = 0;
     t->frames = 0;
@@ -169,11 +207,12 @@ static void finish_rx(int i, unsigned status)
     g.rx_pending--;
     if (status) {
         g.rx_errors++;
-        note_error("bulk IN status", (int)status);
+        note_error(ERR_IN, (int)status);
         if (status == USB_STATUS_STALLED) g_endpoints[i].flags |= USB_FS_FLAG_CLEAR_STALL;
-        if (g.rx_errors >= MAX_RX_ERRORS) g.gone = 1;
+        if (g.rx_errors >= MAX_RX_ERRORS) lose("bulk IN failures:", (int)g.rx_errors);
         return;
     }
+    g.rx_done++;
     g_endpoints[i].flags &= (uint8_t)~USB_FS_FLAG_CLEAR_STALL;
     if (g.done_count < VND_MAX_RX) g.done[g.done_count++] = i;
 }
@@ -190,9 +229,11 @@ static int reap(void)
 
         memset(&done, 0, sizeof done);
         if (ioctl(g.fd, USB_FS_COMPLETE, &done) != 0) {
-            if (errno != EBUSY) {
-                if (dead_errno(errno)) g.gone = 1;
-                note_error("USB_FS_COMPLETE errno", errno);
+            int code = errno;
+
+            if (code != EBUSY) {
+                note_error(ERR_COMPLETE, code);
+                if (dead_errno(code)) lose("USB_FS_COMPLETE errno", code);
             }
             return taken;
         }
@@ -219,8 +260,13 @@ static int wait_for_completion(int ms)
 static void deliver_transfer(int i, size_t len)
 {
     size_t count = 0, k;
+    int result = rtl_rx_scan(g_chip, g_rx_data[i], len, g_views, MAX_FRAMES, &count);
 
-    rtl_rx_scan(g_chip, g_rx_data[i], len, g_views, MAX_FRAMES, &count);
+    if (result) {                       /* the frames before the bad descriptor still go up */
+        pthread_mutex_lock(&g_lock);
+        note_error(ERR_SCAN, result);
+        pthread_mutex_unlock(&g_lock);
+    }
 
     for (k = 0; k < count; k++) {
         g_frames[k].data = g_views[k].data;
@@ -378,6 +424,9 @@ void vnd_close(void)
     pthread_mutex_unlock(&g_lock);
     if (g.thread_running) pthread_join(g.thread, NULL);
     g.thread_running = 0;
+    if (g.opened)
+        say("usb: out %lu ok, %lu failed; in %lu ok, %lu failed, %lu cut short; start errors %lu, completion errors %lu", g.tx_done,
+            g.errors[ERR_OUT], g.rx_done, g.errors[ERR_IN], g.errors[ERR_SCAN], g.errors[ERR_START], g.errors[ERR_COMPLETE]);
     if (g.opened && !g.gone) {
         memset(&uninit, 0, sizeof uninit);
         if (ioctl(g.fd, USB_FS_UNINIT, &uninit) != 0) say("USB_FS_UNINIT: errno %d", errno);

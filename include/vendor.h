@@ -54,9 +54,16 @@ int vnd_regs_address_matches(const uint8_t mac[6]);
 int vnd_regs_bring_up(const uint8_t mac[6]);
 /* The filter comes last, once bulk IN is pending. */
 int vnd_regs_open_filter(void);
-/* Stops the MAC. Writes go only where bring-up already wrote. */
+/* Says the chip's counters, then stops the MAC. Writes go only where bring-up already
+ * wrote. */
 void vnd_regs_stop(void);
 /* PLA_PHYSTATUS; 0 if it could not be read. */
 uint16_t vnd_regs_phy_status(void);
+/* The same, telling a chip that did not answer from one without a link: -1 with errno
+ * set, or with errno 0 if the reply was short. */
+int vnd_regs_read_phy(uint16_t *status);
+/* Whether the MAC still receives and transmits, as bring-up left it. A chip that reset
+ * itself does not. 1: yes, 0: no, -1: unreadable. */
+int vnd_regs_enabled(void);
 int vnd_regs_mark_link(int up);
 #endif

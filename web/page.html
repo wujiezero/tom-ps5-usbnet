@@ -401,10 +401,10 @@ nav{width:100%}
 <div class="scroll"><table class="grid"><thead><tr><th>芯片</th><th>USB ID</th><th>速率</th><th>状态</th></tr></thead><tbody>
 <tr><td>Realtek RTL8159</td><td class="mono">0bda:815a</td><td>1G / 2.5G / 5G / 10Gbps</td><td>已实测</td></tr>
 <tr><td>Realtek RTL8156B / RTL8156BG</td><td class="mono">0bda:8156</td><td>1G / 2.5Gbps</td><td>已实测（2.5G）</td></tr>
-<tr><td>Realtek RTL8157</td><td class="mono">0bda:8157</td><td>1G / 2.5G / 5Gbps</td><td>按 Linux r8152 驱动适配，未实测</td></tr>
+<tr><td>Realtek RTL8157</td><td class="mono">0bda:8157</td><td>1G / 2.5G / 5Gbps</td><td>已实测（5G）</td></tr>
 </tbody></table></div>
 <p>初代 RTL8156（不带 B）以及修改过 USB ID 的贴牌网卡暂不支持。测试机型为 PS5 Slim CFI-2200 B01，系统版本 12.40，其他机型和系统版本尚未测试。</p>
-<p>实测速度（RTL8159，万兆链路）：TCP 上传约 3.2 Gbit/s，下载约 3.0 Gbit/s，上传到 M.2 硬盘约 370–440 MB/s；RTL8156B 在 2.5G 链路下上传到扩展存储约 141 MB/s。网卡驱动运行在用户态，受 USB 传输方式限制，达不到链路的标称速率。</p>
+<p>实测速度（RTL8159，万兆链路）：TCP 上传约 3.2 Gbit/s，下载约 3.0 Gbit/s，上传到 M.2 硬盘约 370–440 MB/s；RTL8156B 在 2.5G 链路下上传到扩展存储约 141 MB/s；RTL8157 在 5G 链路下约 124 MB/s。网卡驱动运行在用户态，受 USB 传输方式限制，达不到链路的标称速率。</p>
 
 <h3 id="about-usage">使用方法</h3>
 <ol>

@@ -348,6 +348,7 @@ static int read_block(unsigned mcu, unsigned address, uint8_t *data, unsigned si
 
     if (rtl_read_request(setup, mcu, address & ~3u, size) != 0) return -1;
     vnd_lock();
+    errno = 0;                          /* still 0 after a failure: the reply was short */
     got = adapter_control_in(g_fd, setup, data);
     vnd_unlock();
     return got == (int)size ? 0 : -1;
@@ -581,14 +582,49 @@ int vnd_regs_open_filter(void)
     return APPLY(g_filter);
 }
 
+/* The chip's own counters since bring-up reset them, as Linux reads them for its
+ * statistics. Missed frames are ones the chip had no room for: the console was not
+ * taking them fast enough. */
+static void say_tally(void)
+{
+    uint8_t data[RTL_TALLY_LEN];
+    struct rtl_tally tally;
+
+    if (read_block(PLA, PLA_TALLY, data, sizeof data) != 0 || rtl_tally_reply(data, sizeof data, &tally) != 0) {
+        say("chip counters: unreadable, errno %d", errno);
+        return;
+    }
+    say("chip counters: rx %llu frames, %u errors, %u missed; tx %llu frames, %llu errors, %u aborted, %u underrun",
+        (unsigned long long)tally.rx_packets, tally.rx_errors, tally.rx_missed, (unsigned long long)tally.tx_packets,
+        (unsigned long long)tally.tx_errors, tally.tx_aborted, tally.tx_underrun);
+}
+
 void vnd_regs_stop(void)
 {
+    say_tally();
     if (APPLY(g_stop) != 0) say("the MAC was not stopped: replug the adapter");
+}
+
+int vnd_regs_read_phy(uint16_t *status)
+{
+    uint32_t value = 0;
+
+    if (read_register(PLA, 0xe908, 2, &value) != 0) return -1;
+    *status = (uint16_t)value;
+    return 0;
 }
 
 uint16_t vnd_regs_phy_status(void)
 {
+    uint16_t status = 0;
+
+    return vnd_regs_read_phy(&status) == 0 ? status : 0;
+}
+
+int vnd_regs_enabled(void)
+{
     uint32_t value = 0;
 
-    return read_register(PLA, 0xe908, 2, &value) == 0 ? (uint16_t)value : 0;
+    if (read_register(PLA, PLA_CR, 1, &value) != 0) return -1;
+    return (value & (CR_RE | CR_TE)) == (CR_RE | CR_TE);
 }

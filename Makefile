@@ -35,6 +35,7 @@ test: all
 	$(BUILD)/test-app
 	$(BUILD)/test-app 8156b
 	$(BUILD)/test-app 8157
+	$(BUILD)/test-app lost
 	$(BUILD)/test-app none
 
 src/app_assets.c: web/page.html assets/icon0.png scripts/embed_assets.py

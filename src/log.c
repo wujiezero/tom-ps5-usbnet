@@ -11,6 +11,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define LOG_FILE APP_DIR "/log.txt"
@@ -23,6 +24,25 @@ typedef struct {
 typedef int (*notify_fn)(int, notify_request *, size_t, int);
 
 static int g_log = -1;
+static long long g_started_ms;
+
+static long long monotonic_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Seconds since the log was opened, so that what happened together can be told from what
+ * happened minutes apart. The clock stands still while the console sleeps. */
+static size_t stamp(char *line, size_t capacity)
+{
+    long long ms = monotonic_ms() - g_started_ms;
+    int n = snprintf(line, capacity, "[%5lld.%03lld] ", ms / 1000, ms % 1000);
+
+    return n > 0 && (size_t)n < capacity ? (size_t)n : 0;
+}
 
 static void write_all(int fd, const char *data, size_t left)
 {
@@ -51,8 +71,9 @@ void say(const char *fmt, ...)
     va_list ap;
     size_t n;
 
+    n = stamp(line, sizeof line);
     va_start(ap, fmt);
-    n = format_line(line, sizeof line, fmt, ap);
+    n += format_line(line + n, sizeof line - n, fmt, ap);
     va_end(ap);
     write_all(1, line, n);
     if (g_log >= 0) write_all(g_log, line, n);
@@ -96,13 +117,18 @@ void notify(const char *text)
 void log_firmware(void)
 {
     uint32_t firmware = kernel_get_fw_version();
+    time_t now = time(NULL);
+    struct tm utc;
 
     say("%s %s, firmware %x.%02x", APP_NAME, APP_VERSION, (unsigned)(firmware >> 24) & 0xff, (unsigned)(firmware >> 16) & 0xff);
+    if (gmtime_r(&now, &utc))
+        say("started %04d-%02d-%02d %02d:%02d:%02d UTC", utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec);
     checkpoint();
 }
 
 int log_open(void)
 {
+    g_started_ms = monotonic_ms();
     mkdir(APP_DIR, 0777);
     rename(LOG_FILE, OLD_LOG_FILE);
     g_log = open(LOG_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);

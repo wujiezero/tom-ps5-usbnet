@@ -30,7 +30,8 @@ int files_job_canceled(void);
  * wrote at its target is removed. Frees the slot. */
 void files_job_end(const char *error_code);
 #ifdef FILES_TESTING
-/* One more volume, for the tests. */
+/* One more volume, for the tests, and how often a long upload is noted. */
 extern const char *files_test_root;
+extern long files_test_sample_ms;
 #endif
 #endif
