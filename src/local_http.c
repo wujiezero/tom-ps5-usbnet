@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -97,11 +98,11 @@ static void start_worker(int fd)
     }
 }
 
-static void *accept_main(void *unused)
+static void *accept_main(void *opaque)
 {
-    struct pollfd wait = {g_listener, POLLIN, 0};
+    int listener = (int)(intptr_t)opaque;
+    struct pollfd wait = {listener, POLLIN, 0};
 
-    (void)unused;
     while (!__atomic_load_n(&g_stop, __ATOMIC_RELAXED)) {
         int ready = poll(&wait, 1, LOCAL_POLL_MS);
 
@@ -114,7 +115,7 @@ static void *accept_main(void *unused)
             break;
         }
         if (ready > 0) {
-            int fd = accept(g_listener, NULL, NULL);
+            int fd = accept(listener, NULL, NULL);
 
             if (fd >= 0) start_worker(fd);
             else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK && errno != ECONNABORTED && errno != EMFILE &&
@@ -124,8 +125,7 @@ static void *accept_main(void *unused)
             }
         }
     }
-    close(g_listener);
-    g_listener = -1;
+    close(listener);
     __atomic_store_n(&g_running, 0, __ATOMIC_RELAXED);
     return NULL;
 }
@@ -137,6 +137,10 @@ int local_http_start(const struct http_backend *backend, uint16_t port, int ever
     pthread_t thread;
     int on = 1, result;
 
+    if (__atomic_load_n(&g_running, __ATOMIC_RELAXED)) {
+        errno = EBUSY;
+        return -1;
+    }
     g_backend = backend;
     g_listener = socket(AF_INET, SOCK_STREAM, 0);
     if (g_listener < 0) return -1;
@@ -160,15 +164,37 @@ int local_http_start(const struct http_backend *backend, uint16_t port, int ever
     __atomic_store_n(&g_running, 1, __ATOMIC_RELAXED);
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    result = pthread_create(&thread, &attr, accept_main, NULL);
+    result = pthread_create(&thread, &attr, accept_main, (void *)(intptr_t)g_listener);
     pthread_attr_destroy(&attr);
     if (result) {
         close(g_listener);
-        g_listener = -1;
         g_running = 0;
-        return -1;
     }
-    return 0;
+    g_listener = -1;                    /* the accept thread owns it now */
+    return result ? -1 : 0;
+}
+
+int local_http_close(void)
+{
+    int tick;
+
+    __atomic_store_n(&g_stop, 1, __ATOMIC_RELAXED);
+    for (tick = 0; tick < LOCAL_STOP_WAIT_TICKS; tick++) {
+        if (!__atomic_load_n(&g_running, __ATOMIC_RELAXED)) return 0;
+        usleep(LOCAL_TICK_US);
+    }
+    say("local page: the listener did not stop");
+    return -1;
+}
+
+int local_http_connections(void)
+{
+    int workers;
+
+    pthread_mutex_lock(&g_lock);
+    workers = g_workers;
+    pthread_mutex_unlock(&g_lock);
+    return workers;
 }
 
 void local_http_stop(void)

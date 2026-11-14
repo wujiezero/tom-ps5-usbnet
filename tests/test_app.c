@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Runs the whole program on the host: real receive thread, lwIP and HTTP, against a
  * simulated ugen node, as an RTL8159 (no argument), as an RTL8156B ("8156b"), as an
- * RTL8157 ("8157"), as an RTL8159 whose bulk OUT stops working for good ("lost"), or with
- * no adapter at all ("none"), when the page is on the host's own loopback. The
+ * RTL8157 ("8157"), as an RTL8159 whose bulk OUT stops working for good ("lost"), as an
+ * RTL8159 whose cable goes in only after the run has given up waiting for it ("late"), or
+ * with no adapter at all ("none"), when the page is on the host's own loopback. The
  * simulated chip holds registers,
  * passes frames only once it has been brought up in the right order, refuses writes
  * off the list below, and frames its bulk transfers as the driver expects. All of
@@ -15,6 +16,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -53,6 +55,7 @@ void services_start(uint16_t echo, uint16_t ftp);
 #define FAIL_OUT_AT 300                 /* which bulk OUT fails as a transaction error would */
 #define USB_ERR_IOERROR_STATUS 18
 #define FRAME_BYTES 2048
+#define NO_LINK (-1L)                   /* link_delay: until the test brings the cable */
 
 static struct {
     pthread_mutex_t lock;
@@ -69,7 +72,7 @@ static struct {
     int configs_seen[4], fs_uninit, resets, absent;
     int out_starts, out_reset_due, out_resets, out_dead, out_failed;
     enum rtl_chip chip;
-    long link_at;
+    long link_at, link_delay;
     pthread_t receiver;
 } m;
 
@@ -464,7 +467,7 @@ static int device_ioctl(unsigned long request, void *arg)
         m.config = *(int *)arg;
         m.configs_seen[m.config]++;
         m.alt = 0;
-        m.link_at = now() + 300;
+        m.link_at = m.link_delay == NO_LINK ? LONG_MAX : now() + m.link_delay;
         *reg(PLA, 0xe810) = m.config == 2 ? 0x0c000000u : 0;
         return 0;
     case USB_IFACE_DRIVER_ACTIVE:
@@ -619,6 +622,38 @@ static int run_without_adapter(const char *root)
     return 0;
 }
 
+/* ---- an adapter without a cable, at first: the page on the kernel's sockets until
+ * the link and an address come ------------------------------------------------ */
+
+static int g_saw_fallback, g_saw_back;
+
+static void *fallback_client(void *unused)
+{
+    static char reply[16384];
+    const char *ask = "GET /api/info HTTP/1.1\r\nHost: 127.0.0.1:" PORT_TEXT "\r\n\r\n";
+    long until = now() + 30000;
+
+    (void)unused;
+    while (now() < until && !g_saw_fallback) {
+        if (http_exchange(ask, reply, sizeof reply) == 0 && strstr(reply, "\"mode\":\"fallback\"")) {
+            assert(strstr(reply, "\"port\":" PORT_TEXT) && strstr(reply, "\"usb_ip\":\"\"") && strstr(reply, "\"link_mbps\":0"));
+            assert(strstr(reply, "\"adapter\":\"RTL8159\"") && strstr(reply, "\"native_port\":" PORT_TEXT));
+            g_saw_fallback = 1;
+        }
+        usleep(25000);
+    }
+    pthread_mutex_lock(&m.lock);
+    m.link_at = now();                  /* the cable goes in */
+    pthread_mutex_unlock(&m.lock);
+    /* Still answered here once the page is back on the adapter, for a page to move. */
+    for (until = now() + 30000; now() < until && !g_saw_back;) {
+        if (http_exchange(ask, reply, sizeof reply) == 0 && strstr(reply, "\"mode\":\"usb\""))
+            g_saw_back = strstr(reply, "\"ip\":\"192.0.2.50\"") && strstr(reply, "\"port\":80") && strstr(reply, "\"usb_ip\":\"192.0.2.50\"");
+        usleep(25000);
+    }
+    return NULL;
+}
+
 /* A run that hangs still shows how far it got. */
 static void timed_out(int signo)
 {
@@ -637,8 +672,9 @@ static int console_id(uint8_t id[16])
 
 int main(int argc, char **argv)
 {
-    int cable[2], size = 1 << 20, status, code;
+    int cable[2], size = 1 << 20, status, code, late = argc > 1 && !strcmp(argv[1], "late");
     char files_root[64];
+    pthread_t watcher;
     pid_t child;
 
     signal(SIGALRM, timed_out);
@@ -647,6 +683,7 @@ int main(int argc, char **argv)
     alarm(120);
     m.chip = argc > 1 && !strcmp(argv[1], "8156b") ? RTL_8156B : argc > 1 && !strcmp(argv[1], "8157") ? RTL_8157 : RTL_8159;
     m.out_dead = argc > 1 && !strcmp(argv[1], "lost");
+    m.link_delay = late ? NO_LINK : 300;
     snprintf(files_root, sizeof files_root, "/tmp/tom-usbnet-files-%d", (int)getpid());
     assert(mkdir(files_root, 0700) == 0);
     peer_files_root = files_test_root = files_root;
@@ -683,7 +720,9 @@ int main(int argc, char **argv)
     *reg(USB, 0xd40c) = 0x00600400u;
     *reg(USB, 0xd4b0) = 0x000300ffu;
     pthread_create(&m.receiver, NULL, receiver, NULL);
+    if (late) assert(pthread_create(&watcher, NULL, fallback_client, NULL) == 0);
     code = app_main();
+    if (late) assert(pthread_join(watcher, NULL) == 0);
     pthread_mutex_lock(&m.lock);
     m.stop = 1;
     pthread_mutex_unlock(&m.lock);
@@ -719,6 +758,15 @@ int main(int argc, char **argv)
         assert(m.resets == 0 && !(*reg(USB, 0xd404) & 0x08000000u));
     }
     assert(strstr(report, "address from dhcp"));
+    if (late) {
+        /* No cable at first: the run goes on, on the console's own network, and comes back. */
+        assert(g_saw_fallback && g_saw_back);
+        assert(strstr(report, "no Ethernet link") && strstr(report, "page on the console's own network"));
+        assert(strstr(report, "local page: listening on every address") && strstr(report, "page back on the adapter"));
+        assert(strstr(report, "page on the console's own network") < strstr(report, "address from dhcp"));
+    } else {
+        assert(!strstr(report, "no Ethernet link") && !strstr(report, "console's own network"));
+    }
     /* One bulk OUT failed: it is said, the endpoint is reset once, and the run goes on. */
     assert(m.out_starts > FAIL_OUT_AT && m.out_resets == 1);
     assert(strstr(report, "bulk OUT status: 18") && strstr(report, "bulk OUT works again after 1 failures"));
@@ -741,6 +789,7 @@ int main(int argc, char **argv)
     assert(m.fs_uninit == 1 && m.configs_seen[2] == 1 && m.configs_seen[0] == 1 && m.config == 0 && m.alt == 0);
     assert(tile_calls[0] == 1 && tile_calls[1] == 1);
     assert(rmdir(files_root) == 0);     /* the peer deleted what it uploaded */
-    printf("end-to-end test passed: %s\n", m.chip == RTL_8156B ? "RTL8156B" : m.chip == RTL_8157 ? "RTL8157" : "RTL8159");
+    printf("end-to-end test passed: %s%s\n", m.chip == RTL_8156B ? "RTL8156B" : m.chip == RTL_8157 ? "RTL8157" : "RTL8159",
+        late ? ", the cable in late" : "");
     return 0;
 }

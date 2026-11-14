@@ -7,6 +7,11 @@
  * only, or with `every_address` on all of the console's. See local_http.c. */
 int local_http_start(const struct http_backend *backend, uint16_t port, int every_address);
 void local_http_stop(void);
+/* Stops taking connections and waits only for that: the open ones go on to their end,
+ * so the listener can be started again on other addresses. -1 if it would not stop. */
+int local_http_close(void);
+/* Connections being served now. */
+int local_http_connections(void);
 /* The listener stopped on an error, as after rest mode: stop it and start it again. */
 int local_http_broken(void);
 #endif

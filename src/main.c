@@ -4,6 +4,9 @@
  * own network on port TILE_PORT. Runs only when the console's owner sends it to their
  * ELF loader.
  *
+ * With an adapter whose network is not there (no cable, or no address), the page goes
+ * on the console's own network too, until the adapter's network is back.
+ *
  * The page has no login: whoever reaches the port on the LAN can read and delete files
  * on the console. See files.c. The run ends from the page; with an adapter, also when
  * the adapter goes away or the console sleeps.
@@ -34,27 +37,44 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef LINK_WAIT_MS
 #define LINK_WAIT_MS 15000L
+#endif
 #define ADDRESS_WAIT_MS 40000L
 #define LINK_SETTLE_US 1000000
 #define LINK_POLL_MS 1000L
 #define LINK_READ_TRIES 3               /* status reads that fail in a row before the link counts as down */
-#define LOCAL_RETRY_S 5
+#define LOCAL_RETRY_MS 5000L
+#define FALLBACK_AFTER_MS 3000L         /* the adapter's network gone this long: the page moves */
+#define RETURN_GRACE_MS 15000L          /* the console's own network keeps the page this long after */
+#define RETURN_IDLE_POLLS 3             /* and until this many polls in a row find no connection */
+#define NATIVE_CHECK_MS 10000L
 #define CONFIG_BYTES 2048
 #define NATIVE_TICK_US 250000
 #define NATIVE_PORT_WAIT_S 30
 #define SLEEP_JUMP_MS 5000L             /* the wall clock ran on while the monotonic one stood */
 
+enum page_on { PAGE_UNDECIDED, PAGE_USB, PAGE_NATIVE };
+enum local_on { LOCAL_NONE, LOCAL_LOOPBACK, LOCAL_EVERYWHERE };
+
 static struct {
-    struct net_lease lease;
+    struct net_lease lease;             /* the last address the adapter had */
     uint8_t mac[6];
     unsigned link_mbps;
-    int stop, link_up, local_waiting, retry_stop;
+    int stop, link_up;
     unsigned bulk_in, bulk_out;
     enum rtl_chip chip;
-    int native;
+    int native;                         /* no adapter at all */
     char native_ip[16];
+    /* With an adapter: where the page is, and the kernel's listener. */
+    enum page_on page;
+    enum local_on local;
+    int usb_ok, elevated, forwarding, announce, local_failed, idle_polls;
+    long lost_at, back_at, local_tried, native_checked;
 } g;
+
+/* What info() reads from the server's threads: the addresses and usb_ok. */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static long now_ms(void)
 {
@@ -76,12 +96,32 @@ static const char *chip_name(void)
     return g.native ? "" : g.chip == RTL_8156B ? "RTL8156B" : g.chip == RTL_8157 ? "RTL8157" : "RTL8159";
 }
 
+/* mode: "usb" on the adapter, "native" without one, "fallback" with one whose network is
+ * not there. ip and port are where the page is now; usb_ip and native_ip let a page on one
+ * find the other. */
 static int info(void *context, char *out, size_t capacity)
 {
+    char usb_ip[16], native_ip[16];
+    int usb;
+
     (void)context;
+    pthread_mutex_lock(&g_lock);
+    memcpy(usb_ip, g.lease.ip, sizeof usb_ip);
+    memcpy(native_ip, g.native_ip, sizeof native_ip);
+    usb = g.usb_ok;
+    pthread_mutex_unlock(&g_lock);
+    if (!g.native && !usb && g.link_up) {
+        struct net_lease lease;         /* the address came before the main loop saw it */
+
+        if (net_address(&lease) == 0) {
+            usb = 1;
+            memcpy(usb_ip, lease.ip, sizeof usb_ip);
+        }
+    }
     snprintf(out, capacity, "{\"name\":\"" APP_NAME "\",\"version\":\"" APP_VERSION "\",\"mode\":\"%s\",\"adapter\":\"%s\",\"ip\":\"%s\","
-        "\"port\":%d,\"link_mbps\":%u,\"max_mbps\":%u}", g.native ? "native" : "usb", chip_name(), g.native ? g.native_ip : g.lease.ip,
-        g.native ? TILE_PORT : 80, g.native ? 0 : g.link_mbps, g.native ? 0 : vnd_regs_max_mbps());
+        "\"port\":%d,\"link_mbps\":%u,\"max_mbps\":%u,\"usb_ip\":\"%s\",\"native_ip\":\"%s\",\"native_port\":%d}",
+        g.native ? "native" : usb ? "usb" : "fallback", chip_name(), usb ? usb_ip : native_ip, usb ? 80 : TILE_PORT,
+        g.native || !g.link_up ? 0 : g.link_mbps, g.native ? 0 : vnd_regs_max_mbps(), g.native ? "" : usb_ip, native_ip, TILE_PORT);
     return 0;
 }
 
@@ -178,49 +218,6 @@ static void watch_link(long t)
     checkpoint();
 }
 
-static int keep_going(void)
-{
-    watch_link(now_ms());
-    return !__atomic_load_n(&g.stop, __ATOMIC_RELAXED) && !vnd_gone();
-}
-
-/* SO_REUSEADDR is set, so EADDRINUSE here is a listener: an earlier run that has not gone.
- * Only the icon needs this port. */
-static void *local_retry(void *unused)
-{
-    (void)unused;
-    while (!__atomic_load_n(&g.retry_stop, __ATOMIC_RELAXED)) {
-        sleep(LOCAL_RETRY_S);
-        if (!__atomic_load_n(&g.retry_stop, __ATOMIC_RELAXED) && local_http_start(&g_backend, TILE_PORT, 0) == 0) {
-            say("local page: listening");
-            checkpoint();
-            break;
-        }
-    }
-    __atomic_store_n(&g.local_waiting, 0, __ATOMIC_RELAXED);
-    return NULL;
-}
-
-static void start_local_page(void)
-{
-    pthread_t thread;
-
-    if (local_http_start(&g_backend, TILE_PORT, 0) == 0) return;
-    say("local page: port %d is held, errno %d, trying again", TILE_PORT, errno);
-    g.local_waiting = 1;
-    if (pthread_create(&thread, NULL, local_retry, NULL) == 0) pthread_detach(thread);
-    else g.local_waiting = 0;
-}
-
-static void stop_local_page(void)
-{
-    int tick;
-
-    __atomic_store_n(&g.retry_stop, 1, __ATOMIC_RELAXED);
-    for (tick = 0; tick < 700 && __atomic_load_n(&g.local_waiting, __ATOMIC_RELAXED); tick++) usleep(10000);
-    local_http_stop();
-}
-
 /* Waits for the chip's fastest rate, which a link that comes up slower can still reach
  * while negotiating. */
 static int wait_for_link(void)
@@ -240,65 +237,246 @@ static int wait_for_link(void)
     return up ? 0 : -1;
 }
 
+/* The console's own address, as its routing table would pick for the LAN. A UDP connect
+ * sends nothing. Never logged. */
+static void native_address(char *out, size_t capacity)
+{
+    struct sockaddr_in to, mine;
+    socklen_t size = sizeof mine;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    out[0] = 0;
+    if (fd < 0) return;
+    memset(&to, 0, sizeof to);
+    to.sin_family = AF_INET;
+    to.sin_port = htons(53);
+    to.sin_addr.s_addr = htonl(0x08080808u);
+    if (connect(fd, (struct sockaddr *)&to, sizeof to) == 0 && getsockname(fd, (struct sockaddr *)&mine, &size) == 0 &&
+            mine.sin_addr.s_addr != htonl(INADDR_ANY))
+        inet_ntop(AF_INET, &mine.sin_addr, out, (socklen_t)capacity);
+    close(fd);
+}
+
+/* Returns whether it changed. */
+static int refresh_native(void)
+{
+    char ip[sizeof g.native_ip];
+    int changed;
+
+    native_address(ip, sizeof ip);
+    pthread_mutex_lock(&g_lock);
+    changed = strcmp(ip, g.native_ip) != 0;
+    memcpy(g.native_ip, ip, sizeof ip);
+    pthread_mutex_unlock(&g_lock);
+    return changed;
+}
+
+/* The page's address on the console's own network, said on the screen and in a
+ * notification; `why` leads the notification. */
+static void announce_native(const char *why)
+{
+    char text[160], ip[sizeof g.native_ip];
+
+    pthread_mutex_lock(&g_lock);
+    memcpy(ip, g.native_ip, sizeof ip);
+    pthread_mutex_unlock(&g_lock);
+    if (ip[0]) {
+        console_line("console address: %s, http://%s:%d/", ip, ip, TILE_PORT);
+        snprintf(text, sizeof text, "%shttp://%s:%d/", why, ip, TILE_PORT);
+    } else {
+        say("the console's address is not known");
+        snprintf(text, sizeof text, "%s端口 %d：用主机的 IP 地址打开", why, TILE_PORT);
+    }
+    notify(text);
+    checkpoint();
+}
+
+/* The kernel's listener: on the loopback address for the icon while the page is on the
+ * adapter, on every address while it is not. Going back to the loopback waits, so that a
+ * page open on the console's address can move to the adapter's, and what it is sending
+ * can end. */
+static void watch_local(long t)
+{
+    enum local_on want = g.page == PAGE_NATIVE ? LOCAL_EVERYWHERE : g.elevated ? LOCAL_LOOPBACK : LOCAL_NONE;
+
+    if (g.local != LOCAL_NONE && local_http_broken()) {
+        say("local page: the listener failed, starting it again");
+        if (local_http_close() == 0) g.local = LOCAL_NONE;
+    }
+    if (g.local == LOCAL_EVERYWHERE && want != LOCAL_EVERYWHERE) {
+        g.idle_polls = local_http_connections() ? 0 : g.idle_polls + 1;
+        if (t - g.back_at < RETURN_GRACE_MS || g.idle_polls < RETURN_IDLE_POLLS) return;
+    }
+    if (want != g.local && (!g.local_failed || t - g.local_tried >= LOCAL_RETRY_MS)) {
+        if (g.local != LOCAL_NONE) {
+            if (local_http_close() != 0) return;
+            g.local = LOCAL_NONE;
+        }
+        if (want != LOCAL_NONE) {
+            g.local_tried = t;
+            if (local_http_start(&g_backend, TILE_PORT, want == LOCAL_EVERYWHERE) == 0) {
+                g.local = want;
+                g.local_failed = 0;
+                say("local page: listening on %s", want == LOCAL_EVERYWHERE ? "every address" : "the loopback address");
+            } else if (!g.local_failed++) {
+                say("local page: port %d is held, errno %d, trying again", TILE_PORT, errno);
+            }
+            checkpoint();
+        }
+    }
+    if (g.announce && g.local == LOCAL_EVERYWHERE) {
+        g.announce = 0;
+        announce_native(g.link_up ? "未获取到 IP 地址，改用主机网络：" : "网线未连接，改用主机网络：");
+    }
+}
+
+static void usb_back(const struct net_lease *lease, long t)
+{
+    static const struct vnd_settings serving = {8, 1, VND_TX_BYTES};
+    static const struct vnd_settings serving_linux = {8, 1, VND_LINUX_TX_BYTES};
+    char text[96];
+    int first = !g.lease.ip[0], moved = strcmp(lease->ip, g.lease.ip) != 0, returning = g.page == PAGE_NATIVE;
+
+    if (first) vnd_configure(g.chip == RTL_8159 ? &serving : &serving_linux);
+    if (moved) say("address from %s%s", lease->source, first ? "" : ", a new one");
+    if (returning) say("page back on the adapter");
+    pthread_mutex_lock(&g_lock);
+    g.lease = *lease;
+    g.usb_ok = 1;
+    pthread_mutex_unlock(&g_lock);
+    g.page = PAGE_USB;
+    g.back_at = t;
+    g.idle_polls = 0;
+    g.announce = 0;
+    smb_client_use_adapter(1);
+    if (moved && g.forwarding) {
+        forward_stop();
+        g.forwarding = 0;
+    }
+    if (!g.forwarding) {
+        if (forward_start(lease->ip) == 0) g.forwarding = 1;
+        else say("port forwarding did not start");
+    }
+    console_line("LAN address: %s, http://%s/", lease->ip, lease->ip);
+    snprintf(text, sizeof text, "%shttp://%s/", returning ? "网卡已恢复，切回网卡：" : "", lease->ip);
+    notify(text);
+    checkpoint();
+}
+
+static void usb_lost(long t)
+{
+    if (g.page == PAGE_USB) say("the adapter's network is gone: %s", g.link_up ? "no address" : "no link");
+    say("page on the console's own network until the adapter's is back");
+    pthread_mutex_lock(&g_lock);
+    g.usb_ok = 0;
+    pthread_mutex_unlock(&g_lock);
+    g.page = PAGE_NATIVE;
+    g.announce = 1;
+    smb_client_use_adapter(0);
+    refresh_native();
+    g.native_checked = t;
+    checkpoint();
+}
+
+/* Where the page is: on the adapter while it has a link and an address, else, after a
+ * moment for a link that only blinked, on the console's own network. Off the adapter the
+ * address is looked for at every turn, so that the page is said to be back as soon as it
+ * can be reached there. */
+static void watch_page(long t)
+{
+    static long last_poll;
+    struct net_lease lease;
+    int usable;
+
+    if (g.page == PAGE_USB && t - last_poll < LINK_POLL_MS) return;
+    last_poll = t;
+    usable = g.link_up && net_address(&lease) == 0;
+    if (usable) {
+        g.lost_at = 0;
+        if (g.page != PAGE_USB || strcmp(lease.ip, g.lease.ip)) usb_back(&lease, t);
+    } else if (g.page == PAGE_UNDECIDED) {
+        usb_lost(t);
+    } else if (g.page == PAGE_USB) {
+        if (!g.lost_at) g.lost_at = t;
+        if (t - g.lost_at >= FALLBACK_AFTER_MS) usb_lost(t);
+    } else if (g.page == PAGE_NATIVE && t - g.native_checked >= NATIVE_CHECK_MS) {
+        g.native_checked = t;
+        if (refresh_native() && g.native_ip[0]) g.announce = 1;      /* only this thread writes it */
+    }
+    watch_local(t);
+}
+
+static int keep_going(void)
+{
+    long t = now_ms();
+
+    watch_link(t);
+    watch_page(t);
+    return !__atomic_load_n(&g.stop, __ATOMIC_RELAXED) && !vnd_gone();
+}
+
+/* With a link, the address is waited for before the page goes anywhere. */
+static void wait_for_address(void)
+{
+    struct net_lease lease;
+    long started = now_ms();
+
+    while (now_ms() - started < ADDRESS_WAIT_MS && !vnd_gone()) {
+        watch_link(now_ms());
+        if (!g.link_up || net_address(&lease) == 0) return;
+        usleep(50000);
+    }
+    say("no address");
+}
+
 static void run_network(void)
 {
     static const struct vnd_settings joining = {8, 1, 16 * 1024};
     /* One transfer at a time, eight receive transfers: on the console 3.2 Gbit/s up and
      * 3.0 down, where thirty-two gave 2.6 up and 3.2 down, and uploads are what this is
      * for. Two transfers at a time were slower, and were in use when an early build
-     * powered the console off. */
-    static const struct vnd_settings serving = {8, 1, VND_TX_BYTES};
-    /* Linux's aggregate size: nothing larger has been sent to an RTL8156B or RTL8157. */
-    static const struct vnd_settings serving_linux = {8, 1, VND_LINUX_TX_BYTES};
-    char text[96];
+     * powered the console off. The serving settings are taken with the first address
+     * (usb_back), Linux's aggregate size for the RTL8156B and RTL8157: nothing larger has
+     * been sent to them. */
 
     vnd_configure(&joining);
-    if (wait_for_link() != 0) {
+    if (wait_for_link() == 0) {
+        g.link_up = 1;
+        g.link_mbps = rtl_phy_mbps(vnd_regs_phy_status());
+        vnd_regs_mark_link(1);
+        net_link(1);
+        usleep(LINK_SETTLE_US);
+        say("link up, %u Mbit/s", g.link_mbps);
+    } else {
         say("no Ethernet link");
-        notify("网线未连接");
-        return;
     }
-    g.link_up = 1;
-    g.link_mbps = rtl_phy_mbps(vnd_regs_phy_status());
-    vnd_regs_mark_link(1);
-    net_link(1);
-    usleep(LINK_SETTLE_US);
-    say("link up, %u Mbit/s", g.link_mbps);
     if (vnd_regs_open_filter() != 0) {
         say("the packet filter could not be set");
         return;
     }
-    if (net_acquire(ADDRESS_WAIT_MS, &g.lease) != 0) {
-        say("no address");
-        notify("未获取到 IP 地址");
+    if (net_up() != 0) {
+        say("DHCP did not start");
         return;
     }
-    say("address from %s", g.lease.source);
-    console_line("LAN address: %s, http://%s/", g.lease.ip, g.lease.ip);
-    checkpoint();
-    snprintf(text, sizeof text, "http://%s/", g.lease.ip);
-    notify(text);
     files_set_log(log_file_line);
     smb_set_store(SMB_STORE);
     say("NAS password key %s", secret_ready() ? "ready" : "unavailable");
-    smb_client_use_adapter(1);
-    vnd_configure(g.chip == RTL_8159 ? &serving : &serving_linux);
-    crash_stage("taking rights");
-    if (tile_elevate() == 0) {
-        files_sweep();
-        crash_stage("starting the local page");
-        start_local_page();
-        tile_resume();
-    }
+    smb_client_use_adapter(0);
     forward_set_store(FORWARD_STORE);
-    if (forward_start(g.lease.ip) != 0) say("port forwarding did not start");
+    if (g.link_up) wait_for_address();
+    crash_stage("taking rights");
+    g.elevated = tile_elevate() == 0;
+    if (g.elevated) files_sweep();
+    crash_stage("starting the page");
+    watch_page(now_ms());
+    if (g.elevated) tile_resume();
     crash_stage("serving");
     if (net_serve(&g_backend, keep_going) != 0) say("the web server did not start: errno %d", errno);
     else say("serving ended: %s", vnd_gone() ? "the adapter was lost" : "asked to stop");
     checkpoint();
-    forward_stop();
+    if (g.forwarding) forward_stop();
     files_stop();
-    stop_local_page();
+    local_http_stop();
     net_stop();
 }
 
@@ -382,40 +560,10 @@ static void run(struct adapter *a)
 
 /* ---- without an adapter --------------------------------------------------- */
 
-/* The console's own address, as its routing table would pick for the LAN. A UDP connect
- * sends nothing. Never logged. */
-static void native_address(char *out, size_t capacity)
-{
-    struct sockaddr_in to, mine;
-    socklen_t size = sizeof mine;
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-
-    out[0] = 0;
-    if (fd < 0) return;
-    memset(&to, 0, sizeof to);
-    to.sin_family = AF_INET;
-    to.sin_port = htons(53);
-    to.sin_addr.s_addr = htonl(0x08080808u);
-    if (connect(fd, (struct sockaddr *)&to, sizeof to) == 0 && getsockname(fd, (struct sockaddr *)&mine, &size) == 0 &&
-            mine.sin_addr.s_addr != htonl(INADDR_ANY))
-        inet_ntop(AF_INET, &mine.sin_addr, out, (socklen_t)capacity);
-    close(fd);
-}
-
 static void announce(void)
 {
-    char text[96];
-
-    native_address(g.native_ip, sizeof g.native_ip);
-    if (g.native_ip[0]) {
-        console_line("console address: %s, http://%s:%d/", g.native_ip, g.native_ip, TILE_PORT);
-        snprintf(text, sizeof text, "http://%s:%d/", g.native_ip, TILE_PORT);
-    } else {
-        say("the console's address is not known");
-        snprintf(text, sizeof text, "端口 %d：用主机的 IP 地址打开", TILE_PORT);
-    }
-    notify(text);
-    checkpoint();
+    refresh_native();
+    announce_native("");
 }
 
 static int listen_everywhere(void)

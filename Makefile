@@ -36,6 +36,7 @@ test: all
 	$(BUILD)/test-app 8156b
 	$(BUILD)/test-app 8157
 	$(BUILD)/test-app lost
+	$(BUILD)/test-app late
 	$(BUILD)/test-app none
 
 src/app_assets.c: web/page.html assets/icon0.png scripts/embed_assets.py
@@ -50,7 +51,7 @@ MOCKED_OBJ := $(patsubst %.c,$(BUILD)/mock/%.o,$(MOCKED))
 HOST_FLAGS = $(TEST_PORT) -Iinclude -Iport -Ithird_party/lwip/src/include -Itests -D_POSIX_C_SOURCE=200809L $(EXTRA) $(CFLAGS) -std=gnu11 -pthread
 
 $(BUILD)/obj/src/files.o: EXTRA := -D_DARWIN_C_SOURCE -DFILES_TESTING
-$(BUILD)/mock/src/main.o: EXTRA := -Dmain=app_main -DSMB_STORE='"$(BUILD)/test-nas.txt"' -DFORWARD_STORE='"$(BUILD)/test-forward.txt"'
+$(BUILD)/mock/src/main.o: EXTRA := -DLINK_WAIT_MS=2000L -Dmain=app_main -DSMB_STORE='"$(BUILD)/test-nas.txt"' -DFORWARD_STORE='"$(BUILD)/test-forward.txt"'
 $(BUILD)/mock/src/adapter.o: EXTRA := -DADAPTER_WAIT_SECONDS=1
 $(BUILD)/mock/tests/test_app.o: EXTRA := -DFORWARD_STORE='"$(BUILD)/test-forward.txt"'
 $(BUILD)/obj/src/local_http.o: EXTRA := -D_DARWIN_C_SOURCE -DLOCAL_HTTP_TESTING

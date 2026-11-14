@@ -113,38 +113,38 @@ void net_link(int up)
     UNLOCK_TCPIP_CORE();
 }
 
-int net_acquire(long timeout_ms, struct net_lease *lease)
+int net_up(void)
 {
-    u32_t start = sys_now();
-    int done = 0;
+    int result;
 
     LOCK_TCPIP_CORE();
     g_up = 1;
     netif_set_up(&g_netif);
-    if (dhcp_start(&g_netif) != ERR_OK) done = -1;
+    result = dhcp_start(&g_netif) == ERR_OK ? 0 : -1;
     UNLOCK_TCPIP_CORE();
-    memset(lease, 0, sizeof *lease);
-    while (!done && (long)(sys_now() - start) < timeout_ms) {
-        LOCK_TCPIP_CORE();
-        if (dhcp_supplied_address(&g_netif)) {
-            const struct dhcp *dhcp = netif_dhcp_data(&g_netif);
+    return result;
+}
 
-            lease->source = "dhcp";
-            lease->lease_seconds = dhcp->offered_t0_lease;
-            ip4addr_ntoa_r(ip_2_ip4(&dhcp->server_ip_addr), lease->server, sizeof lease->server);
-        } else if (autoip_supplied_address(&g_netif)) {
-            lease->source = "link-local";
-        }
-        if (lease->source) {
-            ip4addr_ntoa_r(netif_ip4_addr(&g_netif), lease->ip, sizeof lease->ip);
-            ip4addr_ntoa_r(netif_ip4_netmask(&g_netif), lease->mask, sizeof lease->mask);
-            ip4addr_ntoa_r(netif_ip4_gw(&g_netif), lease->gateway, sizeof lease->gateway);
-            done = 1;
-        }
-        UNLOCK_TCPIP_CORE();
-        sys_msleep(50);
+int net_address(struct net_lease *lease)
+{
+    memset(lease, 0, sizeof *lease);
+    LOCK_TCPIP_CORE();
+    if (dhcp_supplied_address(&g_netif)) {
+        const struct dhcp *dhcp = netif_dhcp_data(&g_netif);
+
+        lease->source = "dhcp";
+        lease->lease_seconds = dhcp->offered_t0_lease;
+        ip4addr_ntoa_r(ip_2_ip4(&dhcp->server_ip_addr), lease->server, sizeof lease->server);
+    } else if (autoip_supplied_address(&g_netif)) {
+        lease->source = "link-local";
     }
-    return done == 1 ? 0 : -1;
+    if (lease->source) {
+        ip4addr_ntoa_r(netif_ip4_addr(&g_netif), lease->ip, sizeof lease->ip);
+        ip4addr_ntoa_r(netif_ip4_netmask(&g_netif), lease->mask, sizeof lease->mask);
+        ip4addr_ntoa_r(netif_ip4_gw(&g_netif), lease->gateway, sizeof lease->gateway);
+    }
+    UNLOCK_TCPIP_CORE();
+    return lease->source ? 0 : -1;
 }
 
 static ssize_t stream_read(void *context, void *data, size_t length)
