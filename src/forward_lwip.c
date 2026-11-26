@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* See forward_lwip.h. lwIP's socket names and constants differ from libc's, so they are
- * only spelled here. One thread reads a connection while another writes it: with
- * LWIP_TCPIP_CORE_LOCKING a read waits on the receive mailbox only, so the two never
- * share the connection's op_completed semaphore, which only writes and closes wait on. */
+ * only spelled here. One thread reads a connection while another writes or shuts it
+ * down: LWIP_NETCONN_FULLDUPLEX with LWIP_NETCONN_SEM_PER_THREAD keeps concurrent
+ * read, write and shutdown on the same socket safe across threads. */
 #include "forward_lwip.h"
 
 #include "lwip/sockets.h"
@@ -14,10 +14,11 @@
 int fwd_lwip_listen(uint16_t port, int backlog)
 {
     struct sockaddr_in address;
-    int fd = lwip_socket(AF_INET, SOCK_STREAM, 0), saved;
+    int fd = lwip_socket(AF_INET, SOCK_STREAM, 0), on = 1, saved;
     u32_t nonblocking = 1;
 
     if (fd < 0) return -1;
+    lwip_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
     memset(&address, 0, sizeof address);
     address.sin_len = sizeof address;
     address.sin_family = AF_INET;
@@ -67,6 +68,7 @@ int fwd_lwip_accept(int listener, uint32_t *peer, int timeout_ms)
     socklen_t length = sizeof from;
     struct timeval timeout = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
     int fd = lwip_accept(listener, (struct sockaddr *)&from, &length), on = 1;
+    int idle = 30, interval = 10, count = 6;
     u32_t blocking = 0;
 
     if (fd < 0) return -1;
@@ -75,6 +77,10 @@ int fwd_lwip_accept(int listener, uint32_t *peer, int timeout_ms)
     lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
     lwip_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
     lwip_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+    lwip_setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);
+    lwip_setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+    lwip_setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof interval);
+    lwip_setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof count);
     return fd;
 }
 
@@ -82,7 +88,16 @@ long fwd_lwip_read(int fd, void *data, size_t length)
 {
     ssize_t n = lwip_read(fd, data, length);
 
-    if (n < 0 && (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR)) return FWD_LWIP_TIMEOUT;
+    if (n < 0) {
+        int code = errno;
+
+        if (code == EWOULDBLOCK || code == EAGAIN || code == EINTR) return FWD_LWIP_TIMEOUT;
+        if (code == ENOMEM || code == ENOBUFS) {
+            sys_msleep(10);
+            return FWD_LWIP_TIMEOUT;
+        }
+        errno = code;
+    }
     return (long)n;
 }
 
@@ -90,7 +105,17 @@ long fwd_lwip_write(int fd, const void *data, size_t length)
 {
     ssize_t n = lwip_write(fd, data, length);
 
-    if (n < 0 && (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR)) return FWD_LWIP_TIMEOUT;
+    if (n < 0) {
+        int code = errno;
+
+        if (code == EWOULDBLOCK || code == EAGAIN || code == EINTR) return FWD_LWIP_TIMEOUT;
+        if (code == ENOMEM || code == ENOBUFS) {
+            sys_msleep(10);
+            return FWD_LWIP_TIMEOUT;
+        }
+        errno = code;
+        return -1;
+    }
     if (n == 0) return FWD_LWIP_TIMEOUT;
     return (long)n;
 }

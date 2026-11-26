@@ -774,7 +774,7 @@ int main(int argc, char **argv)
     assert(strstr(report, "chip counters: rx ") && strstr(report, "serving ended: asked to stop"));
     assert(!strstr(report, "link status unreadable") && !strstr(report, "link down"));
     assert(strstr(report, "NAS password key ready"));
-    assert(strstr(report, "forward: 11 rules, 11 on") && strstr(report, "forward: 2 rules saved"));
+    assert(strstr(report, "forward: 15 rules, 15 on") && strstr(report, "forward: 2 rules saved"));
     assert(strstr(console, "http://192.0.2.50/"));
     assert(!strstr(report, "192.0.2.50"));              /* the address stays out of the file */
     assert(strstr(report, ": 17825799 bytes in"));

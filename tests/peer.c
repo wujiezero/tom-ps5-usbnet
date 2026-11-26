@@ -441,15 +441,36 @@ static size_t read_rest(int fd, char *out, size_t capacity)
     return used;
 }
 
+static void *stream_writer(void *opaque)
+{
+    int fd = (int)(intptr_t)opaque;
+    enum { STREAM_BYTES = 4 * 1024 * 1024 };
+    char *data = malloc(STREAM_BYTES);
+    size_t at = 0, i;
+
+    CHECK(data);
+    for (i = 0; i < STREAM_BYTES; i++) data[i] = (char)(i * 11 + i / 2048);
+    while (at < STREAM_BYTES) {
+        size_t chunk = STREAM_BYTES - at < 32768 ? STREAM_BYTES - at : 32768;
+
+        write_all(fd, data + at, chunk);
+        at += chunk;
+    }
+    lwip_shutdown(fd, SHUT_WR);
+    free(data);
+    return NULL;
+}
+
 static void forwarding(void)
 {
-    enum { ECHO = 256 * 1024 };
+    enum { ECHO = 256 * 1024, STREAM_BYTES = 4 * 1024 * 1024, BURST = 16 };
     static char data[ECHO], back[ECHO + 1];
     unsigned a, b, c, d, high, low;
-    char line[256];
+    char line[256], *stream_back;
     struct reply r;
-    size_t i;
-    int fd, passive;
+    pthread_t writer;
+    size_t i, got;
+    int fd, passive, burst[BURST];
 
     post_form("/fwd/save", "19200 19201 1 echo\n19202 19203 1 ftp\n", &r);
     CHECK(r.status == 200 && strstr(r.body, "\"port\":19200,\"to\":19201,\"on\":true,\"name\":\"echo\",\"state\":\"listening\""));
@@ -460,6 +481,28 @@ static void forwarding(void)
     lwip_shutdown(fd, SHUT_WR);
     CHECK(read_rest(fd, back, sizeof back) == ECHO && !memcmp(back, data, ECHO));
     lwip_close(fd);
+    /* Full-duplex 4 MiB stream (> TCP_SND_BUF) through lwIP while reading & writing concurrently. */
+    stream_back = malloc(STREAM_BYTES + 1);
+    CHECK(stream_back);
+    fd = connect_port(19200);
+    CHECK(pthread_create(&writer, NULL, stream_writer, (void *)(intptr_t)fd) == 0);
+    got = read_rest(fd, stream_back, STREAM_BYTES + 1);
+    pthread_join(writer, NULL);
+    CHECK(got == STREAM_BYTES);
+    for (i = 0; i < STREAM_BYTES; i++) CHECK(stream_back[i] == (char)(i * 11 + i / 2048));
+    lwip_close(fd);
+    free(stream_back);
+    /* Burst of concurrent connections (> old BACKLOG = 8). */
+    for (i = 0; i < BURST; i++) burst[i] = connect_port(19200);
+    for (i = 0; i < BURST; i++) {
+        char ch = (char)('A' + i), reply_ch = 0;
+
+        write_all(burst[i], &ch, 1);
+        lwip_shutdown(burst[i], SHUT_WR);
+        CHECK(lwip_read(burst[i], &reply_ch, 1) == 1 && reply_ch == ch);
+        CHECK(lwip_read(burst[i], &reply_ch, 1) == 0);
+        lwip_close(burst[i]);
+    }
     fd = connect_port(19202);
     read_line(fd, line, sizeof line);
     CHECK(!strcmp(line, "220 fake ftp"));

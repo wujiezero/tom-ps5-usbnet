@@ -22,8 +22,11 @@
 #define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "test_forward: %s, line %d\n", #condition, __LINE__); exit(1); } } while (0)
 #define OFFSET 30000                    /* forward_fake.c's */
 #define ECHO_BYTES (1 << 20)
+#define DUPLEX_BYTES (4 << 20)
+#define BURST_COUNT 16
 
 void services_start(uint16_t echo, uint16_t ftp);
+void duplex_service_start(uint16_t port);
 
 void say(const char *fmt, ...)
 {
@@ -123,6 +126,7 @@ static void routes(const char *store)
     forward_set_store(store);
     CHECK(call("GET", "/fwd/rules", NULL, reply, sizeof reply) == 200);
     CHECK(strstr(reply, "\"running\":false") && strstr(reply, "\"port\":9021,\"to\":9021,\"on\":true") && strstr(reply, "\"presets\":[{\"port\":9021"));
+    CHECK(strstr(reply, "\"port\":9120,") && strstr(reply, "\"port\":9180,") && strstr(reply, "\"port\":8844,") && strstr(reply, "\"port\":18842,"));
     CHECK(strstr(reply, "\"reserved\":[80,9190]"));
     CHECK(call("POST", "/fwd/save", "80 80 1 -\n", reply, sizeof reply) == 400 && strstr(reply, "reserved_port"));
     CHECK(call("POST", "/fwd/save", "9000 9190 1 -\n", reply, sizeof reply) == 400 && strstr(reply, "reserved_port"));
@@ -267,6 +271,57 @@ static void ftp(void)
     close(control);
 }
 
+static void *duplex_writer(void *opaque)
+{
+    int fd = (int)(intptr_t)opaque;
+    char *data = malloc(DUPLEX_BYTES);
+    size_t at = 0, i;
+
+    CHECK(data);
+    for (i = 0; i < DUPLEX_BYTES; i++) data[i] = (char)(i * 3 + 1);
+    while (at < DUPLEX_BYTES) {
+        size_t chunk = DUPLEX_BYTES - at < 32768 ? DUPLEX_BYTES - at : 32768;
+        ssize_t n = write(fd, data + at, chunk);
+
+        CHECK(n > 0);
+        at += (size_t)n;
+    }
+    shutdown(fd, SHUT_WR);
+    free(data);
+    return NULL;
+}
+
+static void duplex_and_burst(void)
+{
+    char *back = malloc(8192);
+    int fd = connect_to(21008 + OFFSET), burst[BURST_COUNT], i;
+    pthread_t writer;
+    size_t total;
+
+    CHECK(fd >= 0 && back);
+    CHECK(pthread_create(&writer, NULL, duplex_writer, (void *)(intptr_t)fd) == 0);
+    total = read_all(fd, back, 8191);
+    back[total] = 0;
+    pthread_join(writer, NULL);
+    CHECK(strstr(back, "OK:4194304\n"));
+    close(fd);
+    free(back);
+
+    for (i = 0; i < BURST_COUNT; i++) {
+        burst[i] = connect_to(21000 + OFFSET);
+        CHECK(burst[i] >= 0);
+    }
+    for (i = 0; i < BURST_COUNT; i++) {
+        char ch = (char)('a' + i), got = 0;
+
+        CHECK(write(burst[i], &ch, 1) == 1);
+        shutdown(burst[i], SHUT_WR);
+        CHECK(read(burst[i], &got, 1) == 1 && got == ch);
+        CHECK(read(burst[i], &got, 1) == 0);
+        close(burst[i]);
+    }
+}
+
 static void relay(void)
 {
     static char reply[65536];
@@ -274,6 +329,7 @@ static void relay(void)
     int fd, tries;
 
     services_start(21001, 21003);
+    duplex_service_start(21007);
     CHECK(forward_start("192.0.2.50") == 0);
     for (tries = 0; tries < 100; tries++) {
         CHECK(call("GET", "/fwd/rules", NULL, reply, sizeof reply) == 200);
@@ -287,20 +343,23 @@ static void relay(void)
     CHECK(fd >= 0 && read(fd, &byte, 1) <= 0);
     close(fd);
     CHECK(connect_to(21006 + OFFSET) < 0);
-    /* Saved while running: 21006 starts, 21004 stops. */
-    CHECK(call("POST", "/fwd/save", "21000 21001 1 -\n21002 21003 1 -\n21006 21001 1 -\n", reply, sizeof reply) == 200);
+    /* Saved while running: 21006 starts, 21004 stops, 21008 -> 21007 duplex starts. */
+    CHECK(call("POST", "/fwd/save", "21000 21001 1 -\n21002 21003 1 -\n21006 21001 1 -\n21008 21007 1 duplex\n", reply, sizeof reply) == 200);
     CHECK(strstr(reply, "\"port\":21006,\"to\":21001,\"on\":true,\"name\":\"\",\"state\":\"listening\""));
+    CHECK(strstr(reply, "\"port\":21008,\"to\":21007,\"on\":true,\"name\":\"duplex\",\"state\":\"listening\""));
     CHECK(connect_to(21004 + OFFSET) < 0);
     fd = connect_to(21006 + OFFSET);
     CHECK(fd >= 0 && write(fd, "x", 1) == 1 && read(fd, &byte, 1) == 1 && byte == 'x');
     close(fd);
+    duplex_and_burst();
     for (tries = 0; tries < 100; tries++) {
         CHECK(call("GET", "/fwd/rules", NULL, reply, sizeof reply) == 200);
-        if (strstr(reply, "\"port\":21006,\"to\":21001,\"on\":true,\"name\":\"\",\"state\":\"listening\",\"links\":0")) break;
+        if (strstr(reply, "\"port\":21006,\"to\":21001,\"on\":true,\"name\":\"\",\"state\":\"listening\",\"links\":0") &&
+                strstr(reply, "\"port\":21000,\"to\":21001,\"on\":true,\"name\":\"\",\"state\":\"listening\",\"links\":0,\"bytes\":2097184"))
+            break;
         usleep(20000);
     }
     CHECK(tries < 100);
-    CHECK(strstr(reply, "\"port\":21000,\"to\":21001,\"on\":true,\"name\":\"\",\"state\":\"listening\",\"links\":0,\"bytes\":2097152"));
     forward_stop();
     CHECK(connect_to(21000 + OFFSET) < 0);
     CHECK(call("GET", "/fwd/rules", NULL, reply, sizeof reply) == 200 && strstr(reply, "\"running\":false"));

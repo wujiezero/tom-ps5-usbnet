@@ -60,6 +60,51 @@ static int cond_wait(pthread_cond_t *cond, pthread_mutex_t *lock, u32_t remainin
     return pthread_cond_timedwait(cond, lock, &when);
 #endif
 }
+static pthread_key_t sem_key;
+static pthread_once_t sem_key_once = PTHREAD_ONCE_INIT;
+static void sem_key_destroy(void *value)
+{
+    sys_sem_t *slot = value;
+    if (!slot) return;
+    if (sys_sem_valid(slot)) sys_sem_free(slot);
+    free(slot);
+}
+static void sem_key_init(void)
+{
+    pthread_key_create(&sem_key, sem_key_destroy);
+}
+static sys_sem_t *thread_sem_slot(void)
+{
+    sys_sem_t *slot;
+    pthread_once(&sem_key_once, sem_key_init);
+    slot = pthread_getspecific(sem_key);
+    if (slot) return slot;
+    slot = calloc(1, sizeof(*slot));
+    if (!slot) return NULL;
+    if (sys_sem_new(slot, 0) != ERR_OK || pthread_setspecific(sem_key, slot) != 0) {
+        if (sys_sem_valid(slot)) sys_sem_free(slot);
+        free(slot);
+        return NULL;
+    }
+    return slot;
+}
+sys_sem_t *un_thread_sem_get(void)
+{
+    return thread_sem_slot();
+}
+void un_thread_sem_alloc(void)
+{
+    (void)thread_sem_slot();
+}
+void un_thread_sem_free(void)
+{
+    sys_sem_t *slot;
+    pthread_once(&sem_key_once, sem_key_init);
+    slot = pthread_getspecific(sem_key);
+    if (!slot) return;
+    pthread_setspecific(sem_key, NULL);
+    sem_key_destroy(slot);
+}
 void sys_init(void) { pthread_once(&protect_once, protect_init); }
 u32_t sys_now(void)
 {

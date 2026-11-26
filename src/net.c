@@ -245,6 +245,7 @@ int net_serve(const struct http_backend *backend, int (*keep_going)(void))
         pthread_mutex_unlock(&g_workers_lock);
         if (!workers) break;
     }
+    lwip_socket_thread_cleanup();
     return 0;
 }
 

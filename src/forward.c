@@ -34,7 +34,7 @@
 #define TICK_MS 1000
 #define WAIT_MS 200
 #define RETRY_MS 5000
-#define BACKLOG 8
+#define BACKLOG 32
 #define DATA_MAX 16
 #define DATA_WAIT_MS 30000
 #define LISTENERS (FORWARD_MAX + DATA_MAX)
@@ -89,6 +89,10 @@ static const struct {
     {1337, "FTP（etaHEN）"},
     {9090, "PKG 直接安装（etaHEN）"},
     {12800, "PKG 直接安装 V2（etaHEN）"},
+    {9120, "ps5upload（传输）"},
+    {9180, "ps5upload（网页）"},
+    {8844, "PKG 管理器（ps5-pkg-manager）"},
+    {18842, "PKG 流式上传（ps5-pkg-manager）"},
     {9081, "内核日志（etaHEN）"},
     {3232, "内核日志（klogsrv）"},
     {8080, "网页（websrv）"},
@@ -392,6 +396,15 @@ static size_t rewrite(struct link *l, char *out, size_t capacity)
 
 /* ---- one connection ------------------------------------------------------------ */
 
+static void note_drop(uint16_t owner, uint16_t to, const char *dir, int code)
+{
+    static unsigned long count;
+    unsigned long n = __atomic_add_fetch(&count, 1, __ATOMIC_RELAXED);
+
+    if (n <= 8 || !(n & (n - 1)))
+        say("forward: %u->%u %s failed, errno %d", owner, to, dir, code);
+}
+
 static int gone(struct link *l)
 {
     return __atomic_load_n(&l->dead, __ATOMIC_RELAXED) || __atomic_load_n(&g_stop, __ATOMIC_RELAXED);
@@ -436,6 +449,8 @@ static int inner_send(struct link *l, const char *p, size_t n)
         if (w > 0) {
             p += w;
             n -= (size_t)w;
+        } else if (w < 0 && errno == ENOBUFS && !gone(l)) {
+            usleep(10000);
         } else if (w == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) || gone(l)) {
             return -1;
         }
@@ -457,7 +472,7 @@ static int send_line(struct link *l)
  * taken for FTP and goes on a line at a time. */
 static int deliver(struct link *l, const char *data, size_t n)
 {
-    if (l->ftp < 0) l->ftp = !l->data && n >= 3 && !memcmp(data, "220", 3);
+    if (l->ftp < 0) l->ftp = !l->data && n >= 4 && !memcmp(data, "220", 3) && (data[3] == ' ' || data[3] == '-');
     if (!l->ftp) return outer_send(l, data, n);
     while (n) {
         size_t room = LINE_BYTES - l->line_used, take = n < room ? n : room;
@@ -484,21 +499,25 @@ static void *outward_main(void *opaque)
 
         if (n > 0) {
             idle = 0;
-            if (inner_send(l, buffer, (size_t)n) != 0) break;
+            if (inner_send(l, buffer, (size_t)n) != 0) {
+                if (!gone(l)) note_drop(l->owner, l->to, "inner write", errno);
+                break;
+            }
             account(l->owner, (uint64_t)n, 0);
             continue;
         }
         if (n == FWD_LWIP_TIMEOUT) {
             if (gone(l)) break;
-            if (__atomic_load_n(&l->inner_done, __ATOMIC_RELAXED) && ++idle > HALF_OPEN_TICKS) break;
+            if (__atomic_load_n(&l->inner_done, __ATOMIC_ACQUIRE) && ++idle > HALF_OPEN_TICKS) break;
             continue;
         }
-        if (n == 0) {
+        if (n == 0 || (__atomic_load_n(&l->inner_done, __ATOMIC_ACQUIRE) && (errno == ECONNRESET || errno == ENOTCONN))) {
             shutdown(l->inner, SHUT_WR);
             free(buffer);
             release(l);
             return NULL;
         }
+        if (!gone(l)) note_drop(l->owner, l->to, "outer read", errno);
         break;
     }
     free(buffer);
@@ -512,6 +531,7 @@ static int inner_connect(uint32_t target, uint16_t port)
     struct sockaddr_in to;
     struct timeval timeout = {TICK_MS / 1000, (TICK_MS % 1000) * 1000};
     int fd = socket(AF_INET, SOCK_STREAM, 0), on = 1;
+    int idle = 30, interval = 10, count = 6;
 
     if (fd < 0) return -1;
     memset(&to, 0, sizeof to);
@@ -528,6 +548,19 @@ static int inner_connect(uint32_t target, uint16_t port)
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);
+#ifdef TCP_KEEPIDLE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof interval);
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof count);
+#endif
+    (void)idle;
+    (void)interval;
+    (void)count;
     return fd;
 }
 
@@ -570,7 +603,10 @@ static void *inward_main(void *opaque)
         ssize_t n = read(l->inner, buffer, BUFFER_BYTES);
 
         if (n > 0) {
-            if (deliver(l, buffer, (size_t)n) != 0) break;
+            if (deliver(l, buffer, (size_t)n) != 0) {
+                if (!gone(l)) note_drop(l->owner, l->to, "outer write", errno);
+                break;
+            }
             account(l->owner, (uint64_t)n, 0);
             continue;
         }
@@ -579,13 +615,17 @@ static void *inward_main(void *opaque)
             continue;
         }
         if (n == 0 && !gone(l)) {
-            if (l->line_used && outer_send(l, l->line, l->line_used) != 0) break;
+            if (l->line_used && outer_send(l, l->line, l->line_used) != 0) {
+                if (!gone(l)) note_drop(l->owner, l->to, "outer write", errno);
+                break;
+            }
+            __atomic_store_n(&l->inner_done, 1, __ATOMIC_RELEASE);
             fwd_lwip_shutdown(l->outer);
-            __atomic_store_n(&l->inner_done, 1, __ATOMIC_RELAXED);
             free(buffer);
             release(l);
             return NULL;
         }
+        if (n < 0 && !gone(l)) note_drop(l->owner, l->to, "inner read", errno);
         break;
     }
     free(buffer);
@@ -643,19 +683,20 @@ static void reconcile(void)
     }
 }
 
-static void take(int slot)
+static int take(int slot)
 {
     struct listener *l;
     struct link *k;
     uint32_t peer = 0;
-    int fd;
+    int fd, was_data;
 
     pthread_mutex_lock(&g_lock);
     l = &g_listeners[slot];
     if (l->fd < 0 || (fd = fwd_lwip_accept(l->fd, &peer, TICK_MS)) < 0) {
         pthread_mutex_unlock(&g_lock);
-        return;
+        return 0;
     }
+    was_data = l->data;
     k = g_links < LINKS_MAX ? calloc(1, sizeof *k) : NULL;
     if (k && l->data) {
         if (peer != l->peer) {          /* the data port is only for whoever asked */
@@ -689,7 +730,7 @@ static void take(int slot)
     pthread_mutex_unlock(&g_lock);
     if (!k) {
         fwd_lwip_close(fd, 1);
-        return;
+        return !was_data;
     }
     k->outer = fd;
     k->inner = -1;
@@ -700,6 +741,7 @@ static void take(int slot)
         account(k->owner, 0, 1);
         free(k);
     }
+    return !was_data;
 }
 
 static void *engine_main(void *unused)
@@ -732,7 +774,7 @@ static void *engine_main(void *unused)
         pthread_mutex_unlock(&g_lock);
         if (fwd_lwip_wait(fds, n, WAIT_MS, ready) <= 0) continue;
         for (i = 0; i < n; i++)
-            if (ready[i]) take(slots[i]);
+            if (ready[i]) while (take(slots[i])) {}
     }
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < LISTENERS; i++)

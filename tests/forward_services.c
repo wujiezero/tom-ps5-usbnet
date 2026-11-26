@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 void services_start(uint16_t echo, uint16_t ftp);
+void duplex_service_start(uint16_t port);
 
 static int listen_on(uint16_t port)
 {
@@ -151,4 +152,56 @@ void services_start(uint16_t echo, uint16_t ftp)
 {
     start(echo, echo_one);
     start(ftp, ftp_one);
+}
+
+struct duplex_state {
+    int fd;
+    int done;
+};
+
+static void *duplex_writer(void *opaque)
+{
+    struct duplex_state *st = opaque;
+    const char tick[] = "PROGRESS\n";
+    int i;
+
+    for (i = 0; i < 64 && !__atomic_load_n(&st->done, __ATOMIC_ACQUIRE); i++) {
+        if (write(st->fd, tick, sizeof tick - 1) != (ssize_t)(sizeof tick - 1)) break;
+        usleep(1000);
+    }
+    return NULL;
+}
+
+static void *duplex_one(void *opaque)
+{
+    int fd = (int)(intptr_t)opaque;
+    struct duplex_state st = {fd, 0};
+    char buffer[65536], summary[64];
+    size_t total = 0;
+    int paused = 0;
+    pthread_t writer;
+    ssize_t n;
+
+    if (pthread_create(&writer, NULL, duplex_writer, &st) != 0) {
+        close(fd);
+        return NULL;
+    }
+    while ((n = read(fd, buffer, sizeof buffer)) > 0) {
+        total += (size_t)n;
+        if (!paused && total >= (1 << 20)) {
+            paused = 1;
+            usleep(10000);
+        }
+    }
+    __atomic_store_n(&st.done, 1, __ATOMIC_RELEASE);
+    pthread_join(writer, NULL);
+    snprintf(summary, sizeof summary, "OK:%zu\n", total);
+    say_line(fd, summary);
+    close(fd);
+    return NULL;
+}
+
+void duplex_service_start(uint16_t port)
+{
+    start(port, duplex_one);
 }

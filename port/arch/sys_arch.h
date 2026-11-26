@@ -20,4 +20,10 @@ void un_sys_msleep(u32_t milliseconds);
 #define sys_mbox_set_invalid(m) (*(m) = NULL)
 #define sys_mutex_valid(m) ((m) != NULL && *(m) != NULL)
 #define sys_mutex_set_invalid(m) (*(m) = NULL)
+sys_sem_t *un_thread_sem_get(void);
+void un_thread_sem_alloc(void);
+void un_thread_sem_free(void);
+#define LWIP_NETCONN_THREAD_SEM_GET() un_thread_sem_get()
+#define LWIP_NETCONN_THREAD_SEM_ALLOC() un_thread_sem_alloc()
+#define LWIP_NETCONN_THREAD_SEM_FREE() un_thread_sem_free()
 #endif
