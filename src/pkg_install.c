@@ -104,10 +104,22 @@ static void derive_content_name(const char *label, char *out, size_t cap)
     if (!out[0]) snprintf(out, cap, "Package");
 }
 
+static int is_valid_pkg_magic(const uint8_t hdr[PKG_HEADER_BYTES])
+{
+    if (hdr[0] != 0x7f) return 0;
+    if (hdr[1] == 'C' && hdr[2] == 'N' && hdr[3] == 'T') return 1;
+    if (hdr[1] == 'F' && hdr[2] == 'I' && hdr[3] == 'H') return 1;
+    return 0;
+}
+
 static void extract_header_cid(const uint8_t hdr[PKG_HEADER_BYTES], char out[48])
 {
     size_t i;
 
+    if (hdr[1] != 'C') {
+        out[0] = 0;
+        return;
+    }
     for (i = 0; i < PKG_CID_MAX; i++) {
         uint8_t c = hdr[PKG_CID_OFFSET + i];
 
@@ -278,7 +290,7 @@ static void *pkg_install_thread(void *arg)
         return NULL;
     }
     err = read_pkg_header(session, file, hdr);
-    if (err || hdr[0] != 0x7f || hdr[1] != 'C' || hdr[2] != 'N' || hdr[3] != 'T') {
+    if (err || !is_valid_pkg_magic(hdr)) {
         wipe(&j->server, sizeof j->server);
         smb_close_file(session, file);
         smb_disconnect(session);
@@ -457,7 +469,7 @@ static int browser_start(const struct http_request *r, struct http_stream *strea
     if (!pkg_install_is_pkg_name(name)) return error_json(stream, 400, "not_pkg");
     if (size < PKG_MIN_BYTES || !r->has_length || r->length != PKG_HEADER_BYTES) return error_json(stream, 400, "bad_pkg");
     if (read_stream_exact(r, stream, hdr, sizeof hdr) != 0) return error_json(stream, 400, "bad_request");
-    if (hdr[0] != 0x7f || hdr[1] != 'C' || hdr[2] != 'N' || hdr[3] != 'T') return error_json(stream, 400, "bad_pkg");
+    if (!is_valid_pkg_magic(hdr)) return error_json(stream, 400, "bad_pkg");
 
     j = calloc(1, sizeof *j);
     if (!j) return error_json(stream, 503, "no_memory");

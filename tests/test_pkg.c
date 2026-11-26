@@ -104,7 +104,7 @@ static int fs_request(const char *method, const char *target, const char *data, 
     return fs_request_bin(method, target, data, data ? strlen(data) : 0, body);
 }
 
-static void write_fake_pkg(const char *path, size_t size, int valid_magic)
+static void write_fake_pkg_magic(const char *path, size_t size, const char *magic4)
 {
     FILE *f = fopen(path, "wb");
     size_t i;
@@ -113,13 +113,15 @@ static void write_fake_pkg(const char *path, size_t size, int valid_magic)
     for (i = 0; i < size; i++) {
         uint8_t b = (uint8_t)((i * 131 + 7) & 0xff);
 
-        if (i == 0 && valid_magic) b = 0x7f;
-        else if (i == 1 && valid_magic) b = 'C';
-        else if (i == 2 && valid_magic) b = 'N';
-        else if (i == 3 && valid_magic) b = 'T';
+        if (magic4 && i < 4) b = (uint8_t)magic4[i];
         fputc(b, f);
     }
     fclose(f);
+}
+
+static void write_fake_pkg(const char *path, size_t size, int valid_magic)
+{
+    write_fake_pkg_magic(path, size, valid_magic ? "\x7f" "CNT" : NULL);
 }
 
 static uint32_t fnv1a_file(const char *path, uint64_t start, size_t len)
@@ -439,6 +441,12 @@ static void test_install_orchestrator(void)
     free(body);
     CHECK(smb_fake_sessions == 0);
 
+    /* 1b. PS5 FIH magic accepted end-to-end */
+    snprintf(bad_path, sizeof bad_path, "%s/media/ps5game.pkg", g_nas);
+    write_fake_pkg_magic(bad_path, 65536, "\x7f" "FIH");
+    run_install_direct("ps5game.pkg", "\"state\":\"done\"", 0);
+    CHECK(smb_fake_sessions == 0);
+
     /* 2. Bad magic rejected before starting HTTP stream */
     snprintf(bad_path, sizeof bad_path, "%s/media/badmagic.pkg", g_nas);
     write_fake_pkg(bad_path, 4096, 0);
@@ -531,12 +539,25 @@ static void test_browser_streaming(void)
     CHECK(strstr(body, "bad_pkg"));
     free(body);
 
+    /* PS5 FIH magic accepted by browser_start */
+    snprintf(target, sizeof target, "/pkg/browser/start?name=browser.pkg&size=%u&mtime=1700000000&client=br1", 200 * 1024);
+    hdr[1] = 'F';
+    hdr[2] = 'I';
+    hdr[3] = 'H';
+    CHECK(fs_request_bin("POST", target, hdr, sizeof hdr, &body) == 200);
+    free(body);
+    CHECK(fs_request("POST", "/fs/cancel", "", &body) == 200);
+    free(body);
+    wait_job("\"state\":\"canceled\"");
+
     /* Happy path end-to-end with 2 concurrent browser pull threads */
+    hdr[1] = 'C';
+    hdr[2] = 'N';
+    hdr[3] = 'T';
     pkg_stub_mode = 0;
     pkg_stub_delay_ms = 0;
     pkg_stub_verified_bytes = 0;
     pkg_stub_hash = 0;
-    snprintf(target, sizeof target, "/pkg/browser/start?name=browser.pkg&size=%u&mtime=1700000000&client=br1", 200 * 1024);
     CHECK(fs_request_bin("POST", target, hdr, sizeof hdr, &body) == 200);
     free(body);
     CHECK(pthread_create(&p1, NULL, browser_pull_worker, &arg) == 0);
