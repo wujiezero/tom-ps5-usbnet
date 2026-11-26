@@ -16,4 +16,7 @@ int pkg_install_is_pkg_name(const char *path);
 
 /* Starts an async NAS streaming install job on files.c's job slot and replies on `stream`. */
 int pkg_install_smb(const struct smb_server *server, const char *share, const char *path, const char *client, struct http_stream *stream);
+
+/* Browser streaming install routes under /pkg/browser/. Returns HTTP_NOT_MINE outside /pkg/. */
+int pkg_install_route(const struct http_request *request, struct http_stream *stream);
 #endif

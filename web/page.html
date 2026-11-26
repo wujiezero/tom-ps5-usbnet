@@ -297,6 +297,7 @@ nav{width:100%}
 <div class="toolbar">
 <button class="primary" id="up-files"><svg class="i"><use href="#up"/></svg>上传文件</button>
 <button id="up-folder"><svg class="i"><use href="#up"/></svg>上传文件夹</button>
+<button id="up-pkg"><svg class="i"><use href="#pkg"/></svg>流式安装</button>
 <button id="mkdir"><svg class="i"><use href="#plus"/></svg>新建文件夹</button>
 <span class="sep" aria-hidden="true"></span>
 <button id="act-down" disabled><svg class="i"><use href="#down"/></svg>下载</button>
@@ -393,7 +394,8 @@ nav{width:100%}
 <li>拖入文件或文件夹即可上传，显示进度、百分比和实时速度；各浏览器页面同步显示传输进度。</li>
 <li>主屏幕图标：点开后用主机浏览器打开本页。</li>
 <li>手动硬盘测速。</li>
-<li>连接 NAS（SMB），浏览共享文件夹，并将文件或文件夹直接复制到主机存储。</li>
+<li>从电脑浏览器直接选择本地 <code>.pkg</code> / <code>.fpkg</code> 流式安装到主机，无需先上传占双份空间。</li>
+<li>连接 NAS（SMB），浏览共享文件夹，将文件复制到主机或直接流式安装 PKG。</li>
 <li>端口转发：通过 USB 网卡的地址访问主机上其他插件的端口。</li>
 <li>没有可用的 USB 网卡时改用主机自带网络，文件管理和 NAS 功能照常可用。</li>
 <li>退出时还原网卡并关闭端口。</li>
@@ -477,6 +479,7 @@ nav{width:100%}
 <div class="ended" id="ended"><div><h2>已退出</h2><p id="ended-text">网卡已恢复，服务已关闭。再次使用前请拔插一次网卡。</p></div></div>
 <input type="file" id="pick-files" multiple hidden>
 <input type="file" id="pick-folder" webkitdirectory hidden>
+<input type="file" id="pick-pkg" accept=".pkg,.fpkg" multiple hidden>
 
 <script>
 'use strict';
@@ -582,6 +585,8 @@ async function nasCopy(){const list=N.entries.filter(e=>N.selected.has(e.name));
 async function nasInstall(){const list=N.entries.filter(e=>N.selected.has(e.name));if(!list.length||list.some(e=>e.dir||!isPkg(e.name)))return;const ok=await modal('流式安装 '+list.length+' 个 PKG？',body=>{body.append(el('div','','直接从 NAS 经由本机回环流式喂给 PS5 系统安装器，不占用主机额外临时空间，支持依次安装多个。安装完成前请勿退出插件或断开 NAS。'));names(body,list.map(e=>e.name+'（'+fmtSize(e.size)+'）'))},[CANCEL,{text:'开始安装',cls:'primary',value:true}]);if(!ok)return;const id=N.id,share=N.share;list.forEach(e=>{const path=nasJoin(N.path,e.name);addTask('pkg',VERB.pkg+e.name,e.size,t=>runPkg(t,id,share,path))})}
 async function runSmb(t,id,share,path,to){await api('/smb/copy?id='+id+'&share='+q(share)+'&path='+q(path)+'&to='+q(to)+'&client='+CLIENT,true);return watchJob(t)}
 async function runPkg(t,id,share,path){await api('/smb/install?id='+id+'&share='+q(share)+'&path='+q(path)+'&client='+CLIENT,true);return watchJob(t)}
+async function pickBrowserPkg(input){const files=Array.from(input.files||[]);input.value='';if(!files.length)return;if(files.some(f=>!isPkg(f.name)))return toast('请选择 .pkg 或 .fpkg 文件',true);const items=[];for(const f of files){if(f.size<512)return toast(f.name+'：'+say_error('bad_pkg'),true);const hdr=new Uint8Array(await f.slice(0,128).arrayBuffer());if(hdr.length<128||hdr[0]!==0x7f||hdr[1]!==0x43||hdr[2]!==0x4e||hdr[3]!==0x54)return toast(f.name+'：'+say_error('bad_pkg'),true);items.push({file:f,hdr})}const ok=await modal('流式安装 '+items.length+' 个本地 PKG？',body=>{body.append(el('div','','由浏览器按需向主机提供分片并直接交给 PS5 系统安装器，不在主机上保存临时安装包。安装完成前请保持本页面开启。'));names(body,items.map(x=>x.file.name+'（'+fmtSize(x.file.size)+'）'))},[CANCEL,{text:'开始安装',cls:'primary',value:true}]);if(!ok)return;items.forEach(x=>addTask('pkg',VERB.pkg+x.file.name,x.file.size,t=>runBrowserPkg(t,x.file,x.hdr)))}
+async function runBrowserPkg(t,file,hdr){const ac=new AbortController();let stopped=false;const mtime=Math.floor((file.lastModified||0)/1000);const r=await fetch('/pkg/browser/start?name='+q(file.name)+'&size='+file.size+'&mtime='+mtime+'&client='+CLIENT,{method:'POST',body:hdr,signal:ac.signal});const j=await r.json().catch(()=>({error:'failed'}));if(!r.ok||j.error){const e=new Error(say_error(j.error));e.code=j.error;throw e}const pull=async()=>{while(!stopped){try{const nr=await fetch('/pkg/browser/need',{signal:ac.signal});const nj=await nr.json();if(nj.done)return;if(nj.idle)continue;if(nj.req){const slice=file.slice(nj.offset,nj.offset+nj.len);const cr=await fetch('/pkg/browser/chunk?req='+nj.req,{method:'POST',body:slice,signal:ac.signal});if(!cr.ok&&!stopped){await new Promise(res=>setTimeout(res,100))}}}catch(e){if(stopped||e.name==='AbortError')return;await new Promise(res=>setTimeout(res,200))}}};const p1=pull(),p2=pull();const prevCancel=()=>{stopped=true;ac.abort();api('/fs/cancel',true).catch(()=>{})};try{const watch=watchJob(t);T.cancel=prevCancel;await watch}finally{stopped=true;ac.abort();await Promise.all([p1,p2]).catch(()=>{})}}
 $('nas-add').onclick=()=>nasSave(null);$('nas-edit').onclick=()=>nasSave(nasServer());$('nas-forget').onclick=nasForget;$('nas-copy').onclick=nasCopy;$('nas-install').onclick=nasInstall;$('nas-refresh').onclick=()=>N.id?nasOpen(N.id,N.share,N.path):nasLoad();
 $('nas-all').onclick=e=>{N.selected=new Set(e.target.checked&&N.share?N.entries.map(x=>x.name):[]);nasPaint()};
 
@@ -603,7 +608,7 @@ async function fwdReset(){const ok=await modal('恢复默认端口？',body=>bod
 $('fwd-add').onclick=()=>fwdEdit(null);$('fwd-presets').onclick=fwdPresets;$('fwd-reset').onclick=fwdReset;
 
 /* ---- wiring ---- */
-$('up-files').onclick=()=>$('pick-files').click();$('up-folder').onclick=()=>$('pick-folder').click();$('pick-files').onchange=e=>fromPicker(e.target);$('pick-folder').onchange=e=>fromPicker(e.target);
+$('up-files').onclick=()=>$('pick-files').click();$('up-folder').onclick=()=>$('pick-folder').click();$('up-pkg').onclick=()=>$('pick-pkg').click();$('pick-files').onchange=e=>fromPicker(e.target);$('pick-folder').onchange=e=>fromPicker(e.target);$('pick-pkg').onchange=e=>pickBrowserPkg(e.target);
 $('mkdir').onclick=makeFolder;$('act-rename').onclick=renameOne;$('act-del').onclick=removeSelected;$('act-down').onclick=download;$('act-copy').onclick=()=>transfer(false);$('act-move').onclick=()=>transfer(true);$('refresh').onclick=refresh;
 $('filter').oninput=e=>{S.filter=e.target.value.toLowerCase();render()};
 $('all').onclick=e=>{S.selected=new Set(e.target.checked?S.shown.map(x=>x.name):[]);paint()};

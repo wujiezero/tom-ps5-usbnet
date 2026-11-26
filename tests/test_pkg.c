@@ -67,16 +67,18 @@ static ssize_t memory_write(void *context, const void *data, size_t length)
 
 static int noop_route(void *c, const struct http_request *r, struct http_stream *s)
 {
+    int rc = pkg_install_route(r, s);
+
     (void)c;
-    return files_route(r, s);
+    return rc != HTTP_NOT_MINE ? rc : files_route(r, s);
 }
 
 static int noop_info(void *c, char *o, size_t n) { (void)c; (void)o; (void)n; return 0; }
 static const struct http_backend g_backend = {.route = noop_route, .info = noop_info};
 
-static int fs_request(const char *method, const char *target, const char *data, char **body)
+static int fs_request_bin(const char *method, const char *target, const void *data, size_t length, char **body)
 {
-    size_t length = data ? strlen(data) : 0, room = 4096 + length;
+    size_t room = 4096 + length;
     char *wire = malloc(room), *split;
     int used = snprintf(wire, room, "%s %s HTTP/1.1\r\nHost: 192.0.2.5\r\n", method, target), status = 0;
     struct memory m = {0};
@@ -84,7 +86,7 @@ static int fs_request(const char *method, const char *target, const char *data, 
 
     if (!strcmp(method, "POST")) used += snprintf(wire + used, room - (size_t)used, "Content-Length: %zu\r\n", length);
     used += snprintf(wire + used, room - (size_t)used, "\r\n");
-    if (data) memcpy(wire + used, data, length);
+    if (data && length) memcpy(wire + used, data, length);
     m.in = (uint8_t *)wire;
     m.in_length = (size_t)used + length;
     http_serve(&g_backend, &stream);
@@ -95,6 +97,11 @@ static int fs_request(const char *method, const char *target, const char *data, 
     if (body) *body = strdup(split ? split + 4 : "");
     free(m.out);
     return status;
+}
+
+static int fs_request(const char *method, const char *target, const char *data, char **body)
+{
+    return fs_request_bin(method, target, data, data ? strlen(data) : 0, body);
 }
 
 static void write_fake_pkg(const char *path, size_t size, int valid_magic)
@@ -459,6 +466,100 @@ static void test_install_orchestrator(void)
     CHECK(smb_fake_sessions == 0);
 }
 
+struct browser_pull_arg {
+    const char *file_path;
+};
+
+static void *browser_pull_worker(void *opaque)
+{
+    struct browser_pull_arg *a = opaque;
+    FILE *f = fopen(a->file_path, "rb");
+
+    CHECK(f);
+    for (;;) {
+        char *body = NULL;
+        uint64_t req = 0, off = 0;
+        size_t len = 0;
+
+        CHECK(fs_request("GET", "/pkg/browser/need", NULL, &body) == 200);
+        if (strstr(body, "\"done\":true")) {
+            free(body);
+            break;
+        }
+        if (sscanf(body, "{\"req\":%" PRIu64 ",\"offset\":%" PRIu64 ",\"len\":%zu}", &req, &off, &len) == 3) {
+            uint8_t *buf = malloc(len);
+            char target[128], *cbody = NULL;
+
+            CHECK(buf && fseeko(f, (off_t)off, SEEK_SET) == 0 && fread(buf, 1, len, f) == len);
+            snprintf(target, sizeof target, "/pkg/browser/chunk?req=%" PRIu64, req);
+            (void)fs_request_bin("POST", target, buf, len, &cbody);
+            free(cbody);
+            free(buf);
+        }
+        free(body);
+    }
+    fclose(f);
+    return NULL;
+}
+
+static void test_browser_streaming(void)
+{
+    char local_pkg[600], target[512], *body = NULL;
+    uint8_t hdr[128], bad_hdr[128];
+    FILE *f;
+    uint32_t expected_hash;
+    pthread_t p1, p2;
+    struct browser_pull_arg arg = {.file_path = local_pkg};
+
+    snprintf(local_pkg, sizeof local_pkg, "%s/browser.pkg", g_root);
+    write_fake_pkg(local_pkg, 200 * 1024, 1);
+    expected_hash = fnv1a_file(local_pkg, 0, 200 * 1024);
+    f = fopen(local_pkg, "rb");
+    CHECK(f && fread(hdr, 1, sizeof hdr, f) == sizeof hdr);
+    fclose(f);
+    memcpy(bad_hdr, hdr, sizeof bad_hdr);
+    bad_hdr[0] = 0;
+
+    /* Validation checks */
+    CHECK(fs_request_bin("POST", "/pkg/browser/start?name=bad.bin&size=204800", hdr, sizeof hdr, &body) == 400);
+    CHECK(strstr(body, "not_pkg"));
+    free(body);
+    CHECK(fs_request_bin("POST", "/pkg/browser/start?name=bad.pkg&size=204800", bad_hdr, sizeof bad_hdr, &body) == 400);
+    CHECK(strstr(body, "bad_pkg"));
+    free(body);
+    CHECK(fs_request_bin("POST", "/pkg/browser/start?name=bad.pkg&size=100", hdr, sizeof hdr, &body) == 400);
+    CHECK(strstr(body, "bad_pkg"));
+    free(body);
+
+    /* Happy path end-to-end with 2 concurrent browser pull threads */
+    pkg_stub_mode = 0;
+    pkg_stub_delay_ms = 0;
+    pkg_stub_verified_bytes = 0;
+    pkg_stub_hash = 0;
+    snprintf(target, sizeof target, "/pkg/browser/start?name=browser.pkg&size=%u&mtime=1700000000&client=br1", 200 * 1024);
+    CHECK(fs_request_bin("POST", target, hdr, sizeof hdr, &body) == 200);
+    free(body);
+    CHECK(pthread_create(&p1, NULL, browser_pull_worker, &arg) == 0);
+    CHECK(pthread_create(&p2, NULL, browser_pull_worker, &arg) == 0);
+    wait_job("\"state\":\"done\"");
+    pthread_join(p1, NULL);
+    pthread_join(p2, NULL);
+    CHECK(pkg_stub_verified_bytes == 200 * 1024);
+    CHECK(pkg_stub_hash == expected_hash);
+
+    /* Cancel mid-transfer */
+    pkg_stub_delay_ms = 40;
+    CHECK(fs_request_bin("POST", target, hdr, sizeof hdr, &body) == 200);
+    free(body);
+    CHECK(pthread_create(&p1, NULL, browser_pull_worker, &arg) == 0);
+    usleep(60000);
+    CHECK(fs_request("POST", "/fs/cancel", "", &body) == 200);
+    free(body);
+    wait_job("\"state\":\"canceled\"");
+    pthread_join(p1, NULL);
+    pkg_stub_delay_ms = 0;
+}
+
 int main(void)
 {
     char path[600], command[700];
@@ -478,6 +579,7 @@ int main(void)
     test_names();
     test_stream_server();
     test_install_orchestrator();
+    test_browser_streaming();
 
     snprintf(command, sizeof command, "rm -rf '%s'", g_root);
     CHECK(system(command) == 0);

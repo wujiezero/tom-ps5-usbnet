@@ -159,6 +159,8 @@ static int route(void *context, const struct http_request *request, struct http_
     }
     result = forward_route(request, stream);
     if (result != HTTP_NOT_MINE) return result;
+    result = pkg_install_route(request, stream);
+    if (result != HTTP_NOT_MINE) return result;
     result = smb_route(request, stream);
     return result != HTTP_NOT_MINE ? result : files_route(request, stream);
 }

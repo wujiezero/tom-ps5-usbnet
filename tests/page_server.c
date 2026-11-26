@@ -6,6 +6,7 @@
  * loopback, each rule's port moved up by 30000 (tests/forward_fake.c). */
 #include "files.h"
 #include "forward.h"
+#include "pkg_install.h"
 #include "smb.h"
 
 #include <arpa/inet.h>
@@ -52,6 +53,8 @@ static int route(void *c, const struct http_request *r, struct http_stream *stre
     if (!strcmp(r->path, "/tile/remove")) return http_respond(stream, 200, "application/json", "{\"state\":\"removed\",\"error\":\"\"}");
     if (!strcmp(r->path, "/tile/install")) return http_respond(stream, 200, "application/json", "{}");
     result = forward_route(r, stream);
+    if (result != HTTP_NOT_MINE) return result;
+    result = pkg_install_route(r, stream);
     if (result != HTTP_NOT_MINE) return result;
     result = smb_route(r, stream);
     return result != HTTP_NOT_MINE ? result : files_route(r, stream);

@@ -34,6 +34,19 @@
 #define STREAM_MAX_CHUNK (1024 * 1024)
 #define STREAM_MIN_CHUNK (64 * 1024)
 #define STREAM_SMB_RETRIES 2
+#define STREAM_BROWSER_CHUNK (2 * 1024 * 1024)
+#define STREAM_PULL_SLOTS 4
+#define STREAM_PULL_WAIT_MS 30000
+
+enum pull_state { PULL_FREE, PULL_NEEDED, PULL_INFLIGHT, PULL_READY, PULL_ERROR };
+
+struct pull_slot {
+    enum pull_state state;
+    uint64_t id;
+    uint64_t offset;
+    size_t len;
+    uint8_t *data;
+};
 
 struct smb_slot {
     struct smb_session *session;
@@ -42,6 +55,7 @@ struct smb_slot {
 };
 
 struct pkg_stream {
+    int browser_mode;
     struct smb_server server;
     char share[128];
     char path[1024];
@@ -66,7 +80,13 @@ struct pkg_stream {
 
     pthread_mutex_t pool_lock;
     struct smb_slot pool[STREAM_MAX_WORKERS];
+
+    pthread_mutex_t pull_lock;
+    pthread_cond_t pull_cond;
+    struct pull_slot pulls[STREAM_PULL_SLOTS];
 };
+
+static uint64_t g_next_pull_id = 1;
 
 struct stream_worker_arg {
     struct pkg_stream *st;
@@ -446,6 +466,71 @@ static int stream_range_from_smb(struct pkg_stream *st, int fd, uint64_t offset,
     return broken != 0 ? -1 : 0;
 }
 
+static int stream_range_from_browser(struct pkg_stream *st, int fd, uint64_t offset, uint64_t length)
+{
+    uint64_t remaining = length;
+
+    while (remaining > 0 && !__atomic_load_n(&st->stop, __ATOMIC_RELAXED)) {
+        size_t ask = remaining < STREAM_BROWSER_CHUNK ? (size_t)remaining : STREAM_BROWSER_CHUNK;
+        int idx = -1, i, err = 0;
+        uint8_t *data = NULL;
+        struct timespec dl;
+
+        pthread_mutex_lock(&st->pull_lock);
+        while (!__atomic_load_n(&st->stop, __ATOMIC_RELAXED)) {
+            for (i = 0; i < STREAM_PULL_SLOTS; i++) {
+                if (st->pulls[i].state == PULL_FREE) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx >= 0) break;
+            pthread_cond_wait(&st->pull_cond, &st->pull_lock);
+        }
+        if (idx < 0 || __atomic_load_n(&st->stop, __ATOMIC_RELAXED)) {
+            pthread_mutex_unlock(&st->pull_lock);
+            return -1;
+        }
+        st->pulls[idx].state = PULL_NEEDED;
+        st->pulls[idx].id = __atomic_fetch_add(&g_next_pull_id, 1, __ATOMIC_RELAXED);
+        st->pulls[idx].offset = offset;
+        st->pulls[idx].len = ask;
+        st->pulls[idx].data = NULL;
+        pthread_cond_broadcast(&st->pull_cond);
+
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += STREAM_PULL_WAIT_MS / 1000;
+        while (!__atomic_load_n(&st->stop, __ATOMIC_RELAXED) && (st->pulls[idx].state == PULL_NEEDED || st->pulls[idx].state == PULL_INFLIGHT)) {
+            if (pthread_cond_timedwait(&st->pull_cond, &st->pull_lock, &dl) == ETIMEDOUT) {
+                err = 1;
+                break;
+            }
+        }
+        if (!err && st->pulls[idx].state == PULL_READY && st->pulls[idx].data && st->pulls[idx].len == ask) {
+            data = st->pulls[idx].data;
+            st->pulls[idx].data = NULL;
+        } else {
+            free(st->pulls[idx].data);
+            st->pulls[idx].data = NULL;
+            err = 1;
+        }
+        st->pulls[idx].state = PULL_FREE;
+        pthread_cond_broadcast(&st->pull_cond);
+        pthread_mutex_unlock(&st->pull_lock);
+
+        if (err || !data) return -1;
+        if (fd_write_all(fd, data, ask) != 0) {
+            free(data);
+            return -1;
+        }
+        free(data);
+        offset += ask;
+        remaining -= ask;
+        __atomic_add_fetch(&st->served, ask, __ATOMIC_RELAXED);
+    }
+    return 0;
+}
+
 static void register_fd(struct pkg_stream *st, int fd)
 {
     int i;
@@ -545,7 +630,11 @@ static void *worker_main(void *opaque)
                 length, st->etag, st->last_modified, keep_alive ? "keep-alive" : "close");
         }
         if (hlen <= 0 || fd_write_all(fd, hdr, (size_t)hlen) != 0) break;
-        if (!is_head && length > 0 && stream_range_from_smb(st, fd, first, length) != 0) break;
+        if (!is_head && length > 0) {
+            int rc = st->browser_mode ? stream_range_from_browser(st, fd, first, length) : stream_range_from_smb(st, fd, first, length);
+
+            if (rc != 0) break;
+        }
         if (!keep_alive) break;
     }
     free(head_buf);
@@ -621,37 +710,25 @@ static void *accept_main(void *opaque)
     return NULL;
 }
 
-int pkg_stream_start(const struct smb_server *server, const char *share, const char *path, struct smb_session *initial_session, void *initial_file,
-    uint64_t size, int64_t mtime, struct pkg_stream **out)
+static int start_common(struct pkg_stream *st)
 {
-    struct pkg_stream *st;
     struct sockaddr_in addr;
     socklen_t alen = sizeof addr;
     int i, on = 1;
     char token[17];
 
-    if (!server || !share || !path || !out) return -1;
-    st = calloc(1, sizeof *st);
-    if (!st) return -1;
-    st->server = *server;
-    snprintf(st->share, sizeof st->share, "%s", share);
-    snprintf(st->path, sizeof st->path, "%s", path);
-    st->size = size;
-    st->mtime = mtime;
     st->listener = -1;
     pthread_mutex_init(&st->lock, NULL);
     pthread_cond_init(&st->done_cond, NULL);
     pthread_mutex_init(&st->pool_lock, NULL);
+    pthread_mutex_init(&st->pull_lock, NULL);
+    pthread_cond_init(&st->pull_cond, NULL);
     for (i = 0; i < STREAM_MAX_WORKERS; i++) st->active_fds[i] = -1;
-    if (initial_session && initial_file) {
-        st->pool[0].session = initial_session;
-        st->pool[0].file = initial_file;
-    }
 
     make_token(token);
     snprintf(st->url_path, sizeof st->url_path, "/pkg/%s/package.pkg", token);
-    snprintf(st->etag, sizeof st->etag, "\"%" PRIx64 "-%" PRIx64 "\"", size, (uint64_t)mtime);
-    format_http_time(mtime, st->last_modified, sizeof st->last_modified);
+    snprintf(st->etag, sizeof st->etag, "\"%" PRIx64 "-%" PRIx64 "\"", st->size, (uint64_t)st->mtime);
+    format_http_time(st->mtime, st->last_modified, sizeof st->last_modified);
 
     st->listener = socket(AF_INET, SOCK_STREAM, 0);
     if (st->listener < 0) goto fail;
@@ -666,16 +743,117 @@ int pkg_stream_start(const struct smb_server *server, const char *share, const c
     st->port = ntohs(addr.sin_port);
     if (pthread_create(&st->accept_thread, NULL, accept_main, st) != 0) goto fail;
     st->accept_started = 1;
-    *out = st;
     return 0;
 
 fail:
     if (st->listener >= 0) close(st->listener);
+    pthread_cond_destroy(&st->pull_cond);
+    pthread_mutex_destroy(&st->pull_lock);
     pthread_mutex_destroy(&st->pool_lock);
     pthread_cond_destroy(&st->done_cond);
     pthread_mutex_destroy(&st->lock);
     wipe(&st->server, sizeof st->server);
     free(st);
+    return -1;
+}
+
+int pkg_stream_start(const struct smb_server *server, const char *share, const char *path, struct smb_session *initial_session, void *initial_file,
+    uint64_t size, int64_t mtime, struct pkg_stream **out)
+{
+    struct pkg_stream *st;
+
+    if (!server || !share || !path || !out) return -1;
+    st = calloc(1, sizeof *st);
+    if (!st) return -1;
+    st->server = *server;
+    snprintf(st->share, sizeof st->share, "%s", share);
+    snprintf(st->path, sizeof st->path, "%s", path);
+    st->size = size;
+    st->mtime = mtime;
+    if (initial_session && initial_file) {
+        st->pool[0].session = initial_session;
+        st->pool[0].file = initial_file;
+    }
+    if (start_common(st) != 0) return -1;
+    *out = st;
+    return 0;
+}
+
+int pkg_stream_start_browser(uint64_t size, int64_t mtime, struct pkg_stream **out)
+{
+    struct pkg_stream *st;
+
+    if (!out) return -1;
+    st = calloc(1, sizeof *st);
+    if (!st) return -1;
+    st->browser_mode = 1;
+    st->size = size;
+    st->mtime = mtime;
+    if (start_common(st) != 0) return -1;
+    *out = st;
+    return 0;
+}
+
+int pkg_stream_pull_need(struct pkg_stream *st, uint64_t *req_id, uint64_t *offset, size_t *len, int timeout_ms)
+{
+    struct timespec dl;
+    int i, found = -1;
+
+    if (!st || !req_id || !offset || !len) return -1;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += timeout_ms / 1000;
+    dl.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (dl.tv_nsec >= 1000000000L) {
+        dl.tv_sec++;
+        dl.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&st->pull_lock);
+    for (;;) {
+        if (__atomic_load_n(&st->stop, __ATOMIC_RELAXED)) {
+            pthread_mutex_unlock(&st->pull_lock);
+            return -1;
+        }
+        for (i = 0; i < STREAM_PULL_SLOTS; i++) {
+            if (st->pulls[i].state == PULL_NEEDED) {
+                found = i;
+                break;
+            }
+        }
+        if (found >= 0) {
+            st->pulls[found].state = PULL_INFLIGHT;
+            *req_id = st->pulls[found].id;
+            *offset = st->pulls[found].offset;
+            *len = st->pulls[found].len;
+            pthread_mutex_unlock(&st->pull_lock);
+            return 1;
+        }
+        if (pthread_cond_timedwait(&st->pull_cond, &st->pull_lock, &dl) == ETIMEDOUT) {
+            pthread_mutex_unlock(&st->pull_lock);
+            return 0;
+        }
+    }
+}
+
+int pkg_stream_pull_give(struct pkg_stream *st, uint64_t req_id, uint8_t *data, size_t len)
+{
+    int i;
+
+    if (!st || !data) return -1;
+    pthread_mutex_lock(&st->pull_lock);
+    if (__atomic_load_n(&st->stop, __ATOMIC_RELAXED)) {
+        pthread_mutex_unlock(&st->pull_lock);
+        return -1;
+    }
+    for (i = 0; i < STREAM_PULL_SLOTS; i++) {
+        if (st->pulls[i].state == PULL_INFLIGHT && st->pulls[i].id == req_id && st->pulls[i].len == len) {
+            st->pulls[i].data = data;
+            st->pulls[i].state = PULL_READY;
+            pthread_cond_broadcast(&st->pull_cond);
+            pthread_mutex_unlock(&st->pull_lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&st->pull_lock);
     return -1;
 }
 
@@ -706,12 +884,21 @@ int pkg_stream_last_smb_error(const struct pkg_stream *st)
     return st ? __atomic_load_n(&st->last_smb_error, __ATOMIC_RELAXED) : 0;
 }
 
+void pkg_stream_signal_stop(struct pkg_stream *st)
+{
+    if (!st) return;
+    __atomic_store_n(&st->stop, 1, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&st->pull_lock);
+    pthread_cond_broadcast(&st->pull_cond);
+    pthread_mutex_unlock(&st->pull_lock);
+}
+
 void pkg_stream_stop(struct pkg_stream *st)
 {
     int i;
 
     if (!st) return;
-    __atomic_store_n(&st->stop, 1, __ATOMIC_RELAXED);
+    pkg_stream_signal_stop(st);
     if (st->listener >= 0) shutdown(st->listener, SHUT_RDWR);
     pthread_mutex_lock(&st->lock);
     for (i = 0; i < STREAM_MAX_WORKERS; i++) {
@@ -729,10 +916,19 @@ void pkg_stream_stop(struct pkg_stream *st)
     while (st->active_workers > 0) pthread_cond_wait(&st->done_cond, &st->lock);
     pthread_mutex_unlock(&st->lock);
 
+    pthread_mutex_lock(&st->pull_lock);
+    for (i = 0; i < STREAM_PULL_SLOTS; i++) {
+        free(st->pulls[i].data);
+        st->pulls[i].data = NULL;
+    }
+    pthread_mutex_unlock(&st->pull_lock);
+
     pthread_mutex_lock(&st->pool_lock);
     for (i = 0; i < STREAM_MAX_WORKERS; i++) close_slot_handles(&st->pool[i]);
     pthread_mutex_unlock(&st->pool_lock);
 
+    pthread_cond_destroy(&st->pull_cond);
+    pthread_mutex_destroy(&st->pull_lock);
     pthread_mutex_destroy(&st->pool_lock);
     pthread_cond_destroy(&st->done_cond);
     pthread_mutex_destroy(&st->lock);
