@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ["src/main.c", "src/adapter.c", "src/log.c", "src/vendor.c", "src/vendor_regs.c", "src/net.c", "src/http_server.c",
            "src/app_assets.c", "src/files.c", "src/tile.c", "src/crash.c", "src/local_http.c", "src/ncm.c", "src/rtl.c", "src/smb.c", "src/smb_client.c", "src/smb_net.c",
-           "src/smb_lwip.c", "src/secret.c", "src/forward.c", "src/forward_lwip.c", "port/sys_arch.c"]
+           "src/smb_lwip.c", "src/secret.c", "src/forward.c", "src/forward_lwip.c", "src/pkg_stream.c", "src/pkg_install.c", "src/pkg_appinst.c", "port/sys_arch.c"]
 LWIP_DIRECTORIES = ["third_party/lwip/src/core", "third_party/lwip/src/core/ipv4", "third_party/lwip/src/api"]
 FLAGS = ["-DUN_COND_REALTIME", "-Iport", "-Ithird_party/lwip/src/include"]
 # libsmb2 is third-party: no -Werror. Its socket calls go to src/smb_net.c (include/smb_sock.h).

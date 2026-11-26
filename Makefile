@@ -19,7 +19,7 @@ SMB2_SRC := $(wildcard third_party/libsmb2/lib/*.c)
 SMB2_CRYPTO := aes aes_reference aes128ccm hmac usha sha1 sha224-256 sha384-512
 SMB2_CRYPTO_OBJ = $(patsubst %,$(BUILD)/obj/third_party/libsmb2/lib/%.o,$(SMB2_CRYPTO))
 SMB2_FLAGS := -DHAVE_CONFIG_H -Ithird_party/libsmb2 -Ithird_party/libsmb2/include -Ithird_party/libsmb2/include/smb2 -include include/smb_sock.h
-TESTS := $(BUILD)/test-rtl $(BUILD)/test-ncm $(BUILD)/test-files $(BUILD)/test-smb $(BUILD)/test-crash $(BUILD)/test-forward $(BUILD)/test-app
+TESTS := $(BUILD)/test-rtl $(BUILD)/test-ncm $(BUILD)/test-files $(BUILD)/test-smb $(BUILD)/test-pkg $(BUILD)/test-crash $(BUILD)/test-forward $(BUILD)/test-app
 
 .PHONY: all test sanitize ps5 prepare clean
 all: $(TESTS) $(BUILD)/page-server
@@ -29,6 +29,7 @@ test: all
 	$(BUILD)/test-ncm
 	$(BUILD)/test-files
 	$(BUILD)/test-smb
+	$(BUILD)/test-pkg
 	$(BUILD)/test-crash
 	$(BUILD)/test-forward
 	rm -f $(BUILD)/test-nas.txt $(BUILD)/test-forward.txt
@@ -44,7 +45,7 @@ src/app_assets.c: web/page.html assets/icon0.png scripts/embed_assets.py
 
 # The real sources against a simulated adapter, with the lwIP options of the console build.
 NET_SRC := src/net.c src/http_server.c src/app_assets.c src/files.c src/rtl.c src/ncm.c src/local_http.c src/smb.c src/smb_client.c src/smb_net.c \
-           src/smb_lwip.c src/secret.c src/forward.c src/forward_lwip.c port/sys_arch.c tests/tile_stub.c tests/peer.c tests/forward_services.c
+           src/smb_lwip.c src/secret.c src/forward.c src/forward_lwip.c src/pkg_stream.c src/pkg_install.c tests/pkg_appinst_stub.c port/sys_arch.c tests/tile_stub.c tests/peer.c tests/forward_services.c
 NET_OBJ := $(patsubst %.c,$(BUILD)/obj/%.o,$(NET_SRC)) $(patsubst %.c,$(BUILD)/obj/%.o,$(LWIP_SRC)) $(patsubst %.c,$(BUILD)/obj/%.o,$(SMB2_SRC))
 MOCKED := src/main.c src/adapter.c src/vendor.c src/vendor_regs.c tests/test_app.c
 MOCKED_OBJ := $(patsubst %.c,$(BUILD)/mock/%.o,$(MOCKED))
@@ -59,6 +60,8 @@ $(BUILD)/obj/src/local_http.o: EXTRA := -D_DARWIN_C_SOURCE -DLOCAL_HTTP_TESTING
 $(BUILD)/obj/src/smb_client.o: EXTRA := -Ithird_party/libsmb2/include
 $(BUILD)/obj/src/smb_net.o: EXTRA := -D_DARWIN_C_SOURCE
 $(BUILD)/obj/src/forward.o: EXTRA := -D_DARWIN_C_SOURCE
+$(BUILD)/obj/src/pkg_stream.o: EXTRA := -D_DARWIN_C_SOURCE
+$(BUILD)/obj/tests/pkg_appinst_stub.o: EXTRA := -D_DARWIN_C_SOURCE
 $(BUILD)/obj/tests/forward_services.o: EXTRA := -D_DARWIN_C_SOURCE
 $(BUILD)/obj/src/secret.o: EXTRA := -D_DARWIN_C_SOURCE -Ithird_party/libsmb2/lib
 
@@ -90,10 +93,16 @@ $(BUILD)/test-files: src/files.c src/http_server.c src/app_assets.c tests/test_f
 	@mkdir -p $(dir $@)
 	$(CC) -Iinclude -D_DARWIN_C_SOURCE -DFILES_TESTING $(CFLAGS) -std=gnu11 -Wall -Wextra -Werror -pthread src/files.c src/http_server.c src/app_assets.c tests/test_files.c -o $@
 
-# The NAS routes and the copy job, against a share that is a local folder (tests/smb_fake.c).
-$(BUILD)/test-smb: src/smb.c src/files.c src/http_server.c src/app_assets.c tests/test_smb.c tests/smb_fake.c include/smb.h include/smb_client.h include/files.h include/http_server.h $(BUILD)/obj/src/secret.o $(SMB2_CRYPTO_OBJ)
+# The NAS routes and the copy/install jobs, against a share that is a local folder (tests/smb_fake.c).
+SMB_TEST := src/smb.c src/pkg_install.c src/pkg_stream.c src/files.c src/http_server.c src/app_assets.c tests/test_smb.c tests/smb_fake.c tests/pkg_appinst_stub.c
+$(BUILD)/test-smb: $(SMB_TEST) include/smb.h include/smb_client.h include/pkg_install.h include/pkg_stream.h include/pkg_appinst.h include/files.h include/http_server.h $(BUILD)/obj/src/secret.o $(SMB2_CRYPTO_OBJ)
 	@mkdir -p $(dir $@)
-	$(CC) -Iinclude -D_DARWIN_C_SOURCE -DFILES_TESTING $(CFLAGS) -std=gnu11 -Wall -Wextra -Werror -pthread src/smb.c src/files.c src/http_server.c src/app_assets.c tests/test_smb.c tests/smb_fake.c $(BUILD)/obj/src/secret.o $(SMB2_CRYPTO_OBJ) -o $@
+	$(CC) -Iinclude -D_DARWIN_C_SOURCE -DFILES_TESTING $(CFLAGS) -std=gnu11 -Wall -Wextra -Werror -pthread $(SMB_TEST) $(BUILD)/obj/src/secret.o $(SMB2_CRYPTO_OBJ) -o $@
+
+PKG_TEST := src/pkg_stream.c src/pkg_install.c src/files.c src/http_server.c src/app_assets.c tests/test_pkg.c tests/smb_fake.c tests/pkg_appinst_stub.c
+$(BUILD)/test-pkg: $(PKG_TEST) include/pkg_stream.h include/pkg_install.h include/pkg_appinst.h include/smb_client.h include/files.h include/http_server.h
+	@mkdir -p $(dir $@)
+	$(CC) -Iinclude -D_DARWIN_C_SOURCE -DFILES_TESTING $(CFLAGS) -std=gnu11 -Wall -Wextra -Werror -pthread $(PKG_TEST) -o $@
 
 $(BUILD)/test-crash: src/crash.c tests/test_crash.c include/crash.h
 	@mkdir -p $(dir $@)
@@ -109,8 +118,8 @@ $(BUILD)/test-app: $(MOCKED_OBJ) $(NET_OBJ)
 	$(CC) $(CFLAGS) -pthread $^ -o $@
 
 # For walking the page in a real browser.
-PAGE_SERVER := tests/page_server.c src/files.c src/http_server.c src/app_assets.c src/smb.c tests/smb_fake.c src/forward.c tests/forward_fake.c
-$(BUILD)/page-server: $(PAGE_SERVER) include/files.h include/http_server.h include/smb.h include/smb_client.h include/forward.h $(BUILD)/obj/src/secret.o $(SMB2_CRYPTO_OBJ)
+PAGE_SERVER := tests/page_server.c src/files.c src/http_server.c src/app_assets.c src/smb.c src/pkg_install.c src/pkg_stream.c tests/pkg_appinst_stub.c tests/smb_fake.c src/forward.c tests/forward_fake.c
+$(BUILD)/page-server: $(PAGE_SERVER) include/files.h include/http_server.h include/smb.h include/smb_client.h include/pkg_install.h include/pkg_stream.h include/pkg_appinst.h include/forward.h $(BUILD)/obj/src/secret.o $(SMB2_CRYPTO_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) -Iinclude -D_DARWIN_C_SOURCE -DFILES_TESTING $(CFLAGS) -std=gnu11 -Wall -Wextra -Werror -pthread $(PAGE_SERVER) $(BUILD)/obj/src/secret.o $(SMB2_CRYPTO_OBJ) -o $@
 

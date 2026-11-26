@@ -376,6 +376,30 @@ static void forgetting(void)
     CHECK(simple("GET", "/smb/shares?id=2", NULL, "not_found") == 404);
 }
 
+static void installs(void)
+{
+    char pkg[600];
+    FILE *f;
+    size_t i;
+
+    snprintf(pkg, sizeof pkg, "%s/media/game.pkg", g_nas);
+    f = fopen(pkg, "wb");
+    CHECK(f);
+    for (i = 0; i < 65536; i++) {
+        int b = i == 0 ? 0x7f : i == 1 ? 'C' : i == 2 ? 'N' : i == 3 ? 'T' : (int)((i * 29 + 3) & 0xff);
+
+        fputc(b, f);
+    }
+    fclose(f);
+    CHECK(simple("POST", "/smb/install?id=1&share=media&path=a.bin", "", "not_pkg") == 400);
+    CHECK(simple("POST", "/smb/install?id=1&share=media&path=../game.pkg", "", "bad_path") == 400);
+    CHECK(simple("POST", "/smb/install?id=99&share=media&path=game.pkg", "", "not_found") == 404);
+    CHECK(simple("POST", "/smb/install?id=1&share=media&path=game.pkg&client=web1", "", "{}") == 200);
+    wait_job("\"state\":\"done\"");
+    CHECK(simple("GET", "/fs/job", NULL, "\"kind\":\"pkg\"") == 200);
+    CHECK(smb_fake_sessions == 0);
+}
+
 int main(void)
 {
     char path[600], command[700];
@@ -410,6 +434,7 @@ int main(void)
     sealing();
     browsing();
     copies();
+    installs();
     forgetting();
     snprintf(command, sizeof command, "rm -rf '%s'", g_root);
     CHECK(system(command) == 0);

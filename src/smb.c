@@ -7,6 +7,7 @@
  * next is read from the share. */
 #include "smb.h"
 #include "files.h"
+#include "pkg_install.h"
 #include "secret.h"
 #include "smb_client.h"
 
@@ -835,11 +836,23 @@ static void *copy_thread(void *argument)
     return NULL;
 }
 
+static void parse_client(const struct http_request *r, char client[CLIENT_BYTES])
+{
+    size_t i;
+
+    client[0] = 0;
+    if (http_query_text(r->query, "client", client, CLIENT_BYTES) != 0) client[0] = 0;
+    for (i = 0; client[i]; i++)
+        if (!((client[i] >= '0' && client[i] <= '9') || (client[i] >= 'a' && client[i] <= 'z'))) {
+            client[0] = 0;
+            break;
+        }
+}
+
 static int copy(const struct http_request *r, struct http_stream *stream)
 {
     struct job *j = calloc(1, sizeof *j);
     char client[CLIENT_BYTES] = "";
-    size_t i;
     int started, result;
 
     if (!j) return error(stream, 503, "no_memory");
@@ -851,14 +864,27 @@ static int copy(const struct http_request *r, struct http_stream *stream)
         free(j);
         return error(stream, 404, "not_found");
     }
-    if (http_query_text(r->query, "client", client, sizeof client) != 0) client[0] = 0;
-    for (i = 0; client[i]; i++)
-        if (!((client[i] >= '0' && client[i] <= '9') || (client[i] >= 'a' && client[i] <= 'z'))) client[0] = 0;
+    parse_client(r, client);
     result = files_job_run(stream, "smb", j->to, j->to, client, copy_thread, j, &started);
     if (!started) {
         wipe(j, sizeof *j);
         free(j);
     }
+    return result;
+}
+
+static int install(const struct http_request *r, struct http_stream *stream)
+{
+    char share[SHARE_BYTES], path[PATH_BYTES], client[CLIENT_BYTES];
+    struct smb_server server;
+    int result;
+
+    if (query_share(r, share, path) != 0 || !path[0]) return error(stream, 400, "bad_path");
+    if (!pkg_install_is_pkg_name(path)) return error(stream, 400, "not_pkg");
+    if (server_of(r, &server) != 0) return error(stream, 404, "not_found");
+    parse_client(r, client);
+    result = pkg_install_smb(&server, share, path, client, stream);
+    wipe(&server, sizeof server);
     return result;
 }
 
@@ -879,6 +905,7 @@ int smb_route(const struct http_request *r, struct http_stream *stream)
         if (!strcmp(path, "save")) return save(r, stream);
         if (!strcmp(path, "forget")) return forget(r, stream);
         if (!strcmp(path, "copy")) return copy(r, stream);
+        if (!strcmp(path, "install")) return install(r, stream);
     }
     return HTTP_NOT_MINE;
 }

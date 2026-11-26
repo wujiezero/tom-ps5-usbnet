@@ -19,6 +19,7 @@
 #include "local_http.h"
 #include "log.h"
 #include "net.h"
+#include "pkg_install.h"
 #include "secret.h"
 #include "smb.h"
 #include "smb_client.h"
@@ -459,6 +460,7 @@ static void run_network(void)
         return;
     }
     files_set_log(log_file_line);
+    pkg_install_set_log(log_file_line);
     smb_set_store(SMB_STORE);
     say("NAS password key %s", secret_ready() ? "ready" : "unavailable");
     smb_client_use_adapter(0);
@@ -596,6 +598,7 @@ static int run_native(void)
     say("serving on the console's own network");
     notify("未找到可用的 USB 网卡，使用主机网络");
     files_set_log(log_file_line);
+    pkg_install_set_log(log_file_line);
     smb_set_store(SMB_STORE);
     say("NAS password key %s", secret_ready() ? "ready" : "unavailable");
     smb_client_use_adapter(0);

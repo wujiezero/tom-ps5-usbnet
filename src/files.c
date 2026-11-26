@@ -65,10 +65,10 @@ static struct {
     pthread_mutex_t lock;
     int running, cancel, move;
     const char *state, *kind;
-    char from[MAX_PATH_BYTES], to[MAX_PATH_BYTES], error[32];
+    char from[MAX_PATH_BYTES], to[MAX_PATH_BYTES], error[32], detail[32];
     uint64_t done, total;
     long started, ended;
-} g_job = {PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, "idle", "", "", "", "", 0, 0, 0, 0};
+} g_job = {PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, "idle", "", "", "", "", "", 0, 0, 0, 0};
 
 /* What every open page shows: the console's browser and a computer on the LAN see the
  * same transfers. id 0 is a free slot. */
@@ -547,6 +547,15 @@ static struct transfer *transfer_begin(const char *kind, const char *path, const
 static void transfer_add(struct transfer *t, uint64_t bytes)
 {
     if (t) __atomic_add_fetch(&t->done, bytes, __ATOMIC_RELAXED);
+}
+
+static void transfer_set(struct transfer *t, uint64_t bytes)
+{
+    uint64_t cur;
+
+    if (!t) return;
+    cur = __atomic_load_n(&t->done, __ATOMIC_RELAXED);
+    while (bytes > cur && !__atomic_compare_exchange_n(&t->done, &cur, bytes, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 }
 
 static void transfer_end(struct transfer *t, const char *state)
@@ -1082,16 +1091,18 @@ int files_job_run(struct http_stream *stream, const char *kind, const char *labe
     char parent[MAX_PATH_BYTES], *slash;
     pthread_attr_t attr;
     pthread_t thread;
-    int result;
+    int result, has_to = to && to[0];
 
     *started = 0;
-    if (!usable(to) || is_volume(to)) return error(stream, 400, "bad_path");
-    if (lstat(to, &st) == 0) return error(stream, 409, "exists");
-    snprintf(parent, sizeof parent, "%s", to);
-    slash = strrchr(parent, '/');
-    if (slash) *slash = 0;
-    if (lstat(parent, &st) != 0) return fail(stream);
-    if (!S_ISDIR(st.st_mode)) return error(stream, 409, "not_folder");
+    if (has_to) {
+        if (!usable(to) || is_volume(to)) return error(stream, 400, "bad_path");
+        if (lstat(to, &st) == 0) return error(stream, 409, "exists");
+        snprintf(parent, sizeof parent, "%s", to);
+        slash = strrchr(parent, '/');
+        if (slash) *slash = 0;
+        if (lstat(parent, &st) != 0) return fail(stream);
+        if (!S_ISDIR(st.st_mode)) return error(stream, 409, "not_folder");
+    }
     pthread_mutex_lock(&g_job.lock);
     if (g_job.running) {
         pthread_mutex_unlock(&g_job.lock);
@@ -1103,12 +1114,13 @@ int files_job_run(struct http_stream *stream, const char *kind, const char *labe
     g_job.kind = kind;
     g_job.state = "running";
     g_job.error[0] = 0;
+    g_job.detail[0] = 0;
     g_job.done = 0;
     g_job.total = 0;
     g_job.started = now_ms();
     g_job.ended = 0;
     snprintf(g_job.from, sizeof g_job.from, "%s", label);
-    snprintf(g_job.to, sizeof g_job.to, "%s", to);
+    snprintf(g_job.to, sizeof g_job.to, "%s", has_to ? to : "");
     snprintf(g_job_client, sizeof g_job_client, "%s", client);
     pthread_mutex_unlock(&g_job.lock);
     pthread_attr_init(&attr);
@@ -1127,14 +1139,18 @@ int files_job_run(struct http_stream *stream, const char *kind, const char *labe
 int files_job_size(uint64_t bytes)
 {
     char parent[MAX_PATH_BYTES], *slash;
+    int has_to;
 
     pthread_mutex_lock(&g_job.lock);
     g_job.total = bytes;
+    has_to = g_job.to[0] != 0;
+    if (has_to) snprintf(parent, sizeof parent, "%s", g_job.to);
     pthread_mutex_unlock(&g_job.lock);
-    snprintf(parent, sizeof parent, "%s", g_job.to);
-    slash = strrchr(parent, '/');
-    if (slash) *slash = 0;
-    if (bytes > free_bytes(parent)) return -1;
+    if (has_to) {
+        slash = strrchr(parent, '/');
+        if (slash) *slash = 0;
+        if (bytes > free_bytes(parent)) return -1;
+    }
     g_job_transfer = transfer_begin(g_job.kind, g_job.from, g_job_client, bytes);
     return 0;
 }
@@ -1144,6 +1160,32 @@ void files_job_add(uint64_t bytes)
     job_add(bytes);
 }
 
+void files_job_set(uint64_t bytes)
+{
+    pthread_mutex_lock(&g_job.lock);
+    if (bytes > g_job.done) g_job.done = bytes;
+    pthread_mutex_unlock(&g_job.lock);
+    transfer_set(g_job_transfer, bytes);
+}
+
+void files_job_detail(const char *detail)
+{
+    size_t i = 0;
+
+    pthread_mutex_lock(&g_job.lock);
+    if (!detail) {
+        g_job.detail[0] = 0;
+    } else {
+        for (; detail[i] && i + 1 < sizeof g_job.detail; i++) {
+            unsigned char c = (unsigned char)detail[i];
+
+            g_job.detail[i] = (c >= 0x20 && c < 0x7f && c != '"' && c != '\\') ? (char)c : '_';
+        }
+        g_job.detail[i] = 0;
+    }
+    pthread_mutex_unlock(&g_job.lock);
+}
+
 int files_job_canceled(void)
 {
     return __atomic_load_n(&g_job.cancel, __ATOMIC_RELAXED);
@@ -1151,13 +1193,27 @@ int files_job_canceled(void)
 
 void files_job_end(const char *error_code)
 {
+    int has_to;
+
+    pthread_mutex_lock(&g_job.lock);
+    has_to = g_job.to[0] != 0;
+    pthread_mutex_unlock(&g_job.lock);
     if (!error_code || !error_code[0]) {
-        note_transfer(g_job.kind, g_job.to, g_job.done, now_ms() - g_job.started, 0);
+        if (has_to) {
+            note_transfer(g_job.kind, g_job.to, g_job.done, now_ms() - g_job.started, 0);
+        } else if (g_log && g_job.done > 0) {
+            long ms = now_ms() - g_job.started;
+            char line[192];
+
+            snprintf(line, sizeof line, "%s: %" PRIu64 " bytes in %ld ms, %" PRIu64 " MB/s", g_job.kind, g_job.done, ms,
+                ms > 0 ? g_job.done / (uint64_t)ms / 1000 : 0);
+            g_log(line);
+        }
         job_finish("done", "");
         return;
     }
     /* The target did not exist when the job began, so all of it is this job's. */
-    remove_tree(g_job.to, 0, NULL);
+    if (has_to) remove_tree(g_job.to, 0, NULL);
     if (!strcmp(error_code, "canceled")) job_finish("canceled", "");
     else job_finish("failed", error_code);
 }
@@ -1227,6 +1283,7 @@ static int start_thread(struct http_stream *stream, void *(*body)(void *), const
     g_job.kind = kind;
     g_job.state = "running";
     g_job.error[0] = 0;
+    g_job.detail[0] = 0;
     g_job.done = 0;
     g_job.total = 0;
     g_job.started = now_ms();
@@ -1276,13 +1333,14 @@ static int start_job(const struct http_request *r, struct http_stream *stream, i
 
 static int job_status(struct http_stream *stream)
 {
-    char json[220];
+    char json[320];
     long ms;
 
     pthread_mutex_lock(&g_job.lock);
     ms = (g_job.running ? now_ms() : g_job.ended) - g_job.started;
-    snprintf(json, sizeof json, "{\"state\":\"%s\",\"kind\":\"%s\",\"error\":\"%s\",\"done\":%" PRIu64 ",\"total\":%" PRIu64 ",\"ms\":%ld,\"move\":%d}", g_job.state,
-        g_job.kind, g_job.error, g_job.done, g_job.total, ms, g_job.move);
+    snprintf(json, sizeof json,
+        "{\"state\":\"%s\",\"kind\":\"%s\",\"error\":\"%s\",\"detail\":\"%s\",\"done\":%" PRIu64 ",\"total\":%" PRIu64 ",\"ms\":%ld,\"move\":%d}", g_job.state,
+        g_job.kind, g_job.error, g_job.detail, g_job.done, g_job.total, ms, g_job.move);
     pthread_mutex_unlock(&g_job.lock);
     return reply(stream, 200, json);
 }
