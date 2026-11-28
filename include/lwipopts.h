@@ -50,6 +50,7 @@
 #define TCP_SND_BUF (32 * TCP_MSS)
 #define TCP_SND_QUEUELEN 128
 #define TCP_LISTEN_BACKLOG 1
+#define SO_REUSE 1
 #define TCPIP_MBOX_SIZE 256
 /* Every queued frame holds one of these. lwIP's default of 8 is far below TCP_WND,
  * so a burst of received frames is dropped before TCP sees it. */
@@ -111,6 +112,7 @@ extern unsigned char *net_heap;
 #define LWIP_TCP_RTO_TIME 1000
 #define TCP_SNDLOWAT (32 * 1024)
 #define TCP_LISTEN_BACKLOG 1
+#define SO_REUSE 1
 /* The page, up to 32 forwarded ports and 16 FTP data ports listening, and the
  * connections of all of them (src/forward.c). */
 #define MEMP_NUM_TCP_PCB 192

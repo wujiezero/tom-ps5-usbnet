@@ -16,6 +16,7 @@
 #include "crash.h"
 #include "files.h"
 #include "forward.h"
+#include "instance.h"
 #include "local_http.h"
 #include "log.h"
 #include "net.h"
@@ -30,6 +31,10 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#ifdef __SCE__
+#include <sys/syscall.h>
+#endif
 
 #include <errno.h>
 #include <pthread.h>
@@ -53,7 +58,6 @@
 #define NATIVE_CHECK_MS 10000L
 #define CONFIG_BYTES 2048
 #define NATIVE_TICK_US 250000
-#define NATIVE_PORT_WAIT_S 30
 #define SLEEP_JUMP_MS 5000L             /* the wall clock ran on while the monotonic one stood */
 
 enum page_on { PAGE_UNDECIDED, PAGE_USB, PAGE_NATIVE };
@@ -72,6 +76,7 @@ static struct {
     enum page_on page;
     enum local_on local;
     int usb_ok, elevated, forwarding, announce, local_failed, idle_polls;
+    int initialized, device_lost;
     long lost_at, back_at, local_tried, native_checked;
 } g;
 
@@ -95,7 +100,7 @@ void net_assert(const char *what, const char *file, int line)
 
 static const char *chip_name(void)
 {
-    return g.native ? "" : g.chip == RTL_8156B ? "RTL8156B" : g.chip == RTL_8157 ? "RTL8157" : "RTL8159";
+    return g.chip == RTL_8156B ? "RTL8156B" : g.chip == RTL_8157 ? "RTL8157" : "RTL8159";
 }
 
 /* mode: "usb" on the adapter, "native" without one, "fallback" with one whose network is
@@ -112,17 +117,9 @@ static int info(void *context, char *out, size_t capacity)
     memcpy(native_ip, g.native_ip, sizeof native_ip);
     usb = g.usb_ok;
     pthread_mutex_unlock(&g_lock);
-    if (!g.native && !usb && g.link_up) {
-        struct net_lease lease;         /* the address came before the main loop saw it */
-
-        if (net_address(&lease) == 0) {
-            usb = 1;
-            memcpy(usb_ip, lease.ip, sizeof usb_ip);
-        }
-    }
     snprintf(out, capacity, "{\"name\":\"" APP_NAME "\",\"version\":\"" APP_VERSION "\",\"mode\":\"%s\",\"adapter\":\"%s\",\"ip\":\"%s\","
         "\"port\":%d,\"link_mbps\":%u,\"max_mbps\":%u,\"usb_ip\":\"%s\",\"native_ip\":\"%s\",\"native_port\":%d}",
-        g.native ? "native" : usb ? "usb" : "fallback", chip_name(), usb ? usb_ip : native_ip, usb ? 80 : TILE_PORT,
+        g.native ? "native" : usb ? "usb" : "fallback", g.native ? "" : chip_name(), usb ? usb_ip : native_ip, usb ? 80 : TILE_PORT,
         g.native || !g.link_up ? 0 : g.link_mbps, g.native ? 0 : vnd_regs_max_mbps(), g.native ? "" : usb_ip, native_ip, TILE_PORT);
     return 0;
 }
@@ -131,6 +128,16 @@ static void stop(void *context)
 {
     (void)context;
     __atomic_store_n(&g.stop, 1, __ATOMIC_RELAXED);
+}
+
+static int stopping(void)
+{
+    if (__atomic_load_n(&g.stop, __ATOMIC_RELAXED)) return 1;
+    if (!instance_stop_requested()) return 0;
+    say("instance: reload requested, releasing services and USB");
+    checkpoint();
+    stop(NULL);
+    return 1;
 }
 
 static void log_file_line(const char *line)
@@ -229,7 +236,7 @@ static int wait_for_link(void)
     long started = now_ms();
     int up = 0;
 
-    while (now_ms() - started < LINK_WAIT_MS && !vnd_gone()) {
+    while (now_ms() - started < LINK_WAIT_MS && !vnd_gone() && !stopping()) {
         uint16_t status = vnd_regs_phy_status();
 
         if (rtl_phy_link(status)) {
@@ -261,18 +268,14 @@ static void native_address(char *out, size_t capacity)
     close(fd);
 }
 
-/* Returns whether it changed. */
-static int refresh_native(void)
+static void refresh_native(void)
 {
     char ip[sizeof g.native_ip];
-    int changed;
 
     native_address(ip, sizeof ip);
     pthread_mutex_lock(&g_lock);
-    changed = strcmp(ip, g.native_ip) != 0;
     memcpy(g.native_ip, ip, sizeof ip);
     pthread_mutex_unlock(&g_lock);
-    return changed;
 }
 
 /* The page's address on the console's own network, said on the screen and in a
@@ -330,7 +333,8 @@ static void watch_local(long t)
     }
     if (g.announce && g.local == LOCAL_EVERYWHERE) {
         g.announce = 0;
-        announce_native(g.link_up ? "未获取到 IP 地址，改用主机网络：" : "网线未连接，改用主机网络：");
+        announce_native(g.native ? "使用主机网络：" :
+            g.link_up ? "未获取到 IP 地址，改用主机网络：" : "网线未连接，改用主机网络：");
     }
 }
 
@@ -369,6 +373,7 @@ static void usb_back(const struct net_lease *lease, long t)
 
 static void usb_lost(long t)
 {
+    if (g.page == PAGE_NATIVE) return;
     if (g.page == PAGE_USB) say("the adapter's network is gone: %s", g.link_up ? "no address" : "no link");
     say("page on the console's own network until the adapter's is back");
     pthread_mutex_lock(&g_lock);
@@ -405,18 +410,57 @@ static void watch_page(long t)
         if (t - g.lost_at >= FALLBACK_AFTER_MS) usb_lost(t);
     } else if (g.page == PAGE_NATIVE && t - g.native_checked >= NATIVE_CHECK_MS) {
         g.native_checked = t;
-        if (refresh_native() && g.native_ip[0]) g.announce = 1;      /* only this thread writes it */
+        refresh_native();
     }
     watch_local(t);
+}
+
+static long wall_ms(void);
+
+static void watch_wake(long mono)
+{
+    static long last_wall, last_mono, next_sample;
+    static int remaining;
+    long wall = wall_ms();
+    long wall_delta = wall - last_wall, mono_delta = mono - last_mono;
+    int first = last_wall == 0;
+
+    last_wall = wall;
+    last_mono = mono;
+    if (first || wall_delta >= SLEEP_JUMP_MS || mono_delta >= SLEEP_JUMP_MS) {
+        say("wake-diag %s: wall_ms=%ld mono_ms=%ld", first ? "baseline" : "execution gap",
+            first ? 0L : wall_delta, first ? 0L : mono_delta);
+        next_sample = mono;
+        remaining = first ? 1 : 6;
+    }
+    if (remaining && mono >= next_sample) {
+        struct net_lease lease;
+        uint16_t phy = 0;
+        int has_address = net_address(&lease) == 0;
+        int phy_result = vnd_regs_read_phy(&phy);
+        int phy_errno = phy_result ? errno : 0;
+
+        vnd_log_snapshot();
+        checkpoint();
+        say("wake-diag network: phy_rc=%d phy_errno=%d phy=0x%04x mac_enabled=%d "
+            "link=%d address=%d page=%d", phy_result, phy_errno, (unsigned)phy,
+            vnd_regs_enabled(), g.link_up, has_address, g.page);
+        checkpoint();
+        next_sample = mono + 2000;
+        remaining--;
+    }
 }
 
 static int keep_going(void)
 {
     long t = now_ms();
 
+    if (vnd_gone()) return 0;
+    watch_wake(t);
     watch_link(t);
+    if (vnd_gone()) return 0;
     watch_page(t);
-    return !__atomic_load_n(&g.stop, __ATOMIC_RELAXED) && !vnd_gone();
+    return !stopping() && !vnd_gone();
 }
 
 /* With a link, the address is waited for before the page goes anywhere. */
@@ -425,12 +469,27 @@ static void wait_for_address(void)
     struct net_lease lease;
     long started = now_ms();
 
-    while (now_ms() - started < ADDRESS_WAIT_MS && !vnd_gone()) {
+    while (now_ms() - started < ADDRESS_WAIT_MS && !vnd_gone() && !stopping()) {
         watch_link(now_ms());
         if (!g.link_up || net_address(&lease) == 0) return;
         usleep(50000);
     }
     say("no address");
+}
+
+static void initialize_service(void)
+{
+    if (g.initialized) return;
+    files_set_log(log_file_line);
+    pkg_install_set_log(log_file_line);
+    pkg_stream_set_log(log_file_line);
+    smb_set_store(SMB_STORE);
+    say("NAS password key %s", secret_ready() ? "ready" : "unavailable");
+    forward_set_store(FORWARD_STORE);
+    crash_stage("taking rights");
+    g.elevated = tile_elevate() == 0;
+    if (g.elevated) files_sweep();
+    g.initialized = 1;
 }
 
 static void run_network(void)
@@ -454,6 +513,7 @@ static void run_network(void)
     } else {
         say("no Ethernet link");
     }
+    if (vnd_gone() || stopping()) return;
     if (vnd_regs_open_filter() != 0) {
         say("the packet filter could not be set");
         return;
@@ -462,28 +522,24 @@ static void run_network(void)
         say("DHCP did not start");
         return;
     }
-    files_set_log(log_file_line);
-    pkg_install_set_log(log_file_line);
-    pkg_stream_set_log(log_file_line);
-    smb_set_store(SMB_STORE);
-    say("NAS password key %s", secret_ready() ? "ready" : "unavailable");
     smb_client_use_adapter(0);
-    forward_set_store(FORWARD_STORE);
     if (g.link_up) wait_for_address();
-    crash_stage("taking rights");
-    g.elevated = tile_elevate() == 0;
-    if (g.elevated) files_sweep();
-    crash_stage("starting the page");
-    watch_page(now_ms());
-    if (g.elevated) tile_resume();
+    initialize_service();
+    g.native = 0;
     crash_stage("serving");
-    if (net_serve(&g_backend, keep_going) != 0) say("the web server did not start: errno %d", errno);
-    else say("serving ended: %s", vnd_gone() ? "the adapter was lost" : "asked to stop");
+    if (g.elevated) tile_resume();
+    while (!vnd_gone() && !stopping()) {
+        const char *failed = net_serve(&g_backend, keep_going);
+
+        if (!failed) break;
+        say("USB Web listener: %s failed, errno %d; retrying", failed, errno);
+        if (g.page != PAGE_NATIVE) usb_lost(now_ms());
+        watch_local(now_ms());
+        checkpoint();
+        sleep(2);
+    }
+    say("serving ended: %s", vnd_gone() ? "the adapter was lost" : "asked to stop");
     checkpoint();
-    if (g.forwarding) forward_stop();
-    files_stop();
-    local_http_stop();
-    net_stop();
 }
 
 /* The one configuration whose only interface is the vendor's. */
@@ -558,31 +614,22 @@ static void run(struct adapter *a)
     }
     if (vnd_open(a->fd, g.chip, g.bulk_in, g.bulk_out, &hooks) == 0) {
         if (net_start(g.mac, &link) != 0) say("the network stack did not start: errno %d", errno);
-        else if (vnd_start() == 0) run_network();
+        else {
+            if (vnd_start() == 0) run_network();
+            if (g.forwarding) {
+                forward_stop();
+                g.forwarding = 0;
+            }
+            smb_client_use_adapter(0);
+            net_stop();
+        }
     }
-    vnd_regs_stop();
+    g.device_lost = vnd_device_lost();
+    if (!vnd_gone()) vnd_regs_stop();
     vnd_close();
 }
 
 /* ---- without an adapter --------------------------------------------------- */
-
-static void announce(void)
-{
-    refresh_native();
-    announce_native("");
-}
-
-static int listen_everywhere(void)
-{
-    int waited;
-
-    for (waited = 0; waited < NATIVE_PORT_WAIT_S; waited++) {
-        if (local_http_start(&g_backend, TILE_PORT, 1) == 0) return 0;
-        if (!waited) say("port %d is held, errno %d, trying again", TILE_PORT, errno);
-        sleep(1);
-    }
-    return -1;
-}
 
 static long wall_ms(void)
 {
@@ -592,69 +639,105 @@ static long wall_ms(void)
     return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* Rest mode keeps this process but not its listener, and may bring a new address. On
- * the firmware ps5upload measured, the monotonic clock stops across it. */
-static int run_native(void)
+/* Host networking remains available while auto mode waits for a USB device. */
+static int run_fallback(int automatic)
 {
     long wall = wall_ms(), mono = now_ms();
 
-    g.native = 1;
-    say("serving on the console's own network");
-    notify("未找到可用的 USB 网卡，使用主机网络");
-    files_set_log(log_file_line);
-    pkg_install_set_log(log_file_line);
-    pkg_stream_set_log(log_file_line);
-    smb_set_store(SMB_STORE);
-    say("NAS password key %s", secret_ready() ? "ready" : "unavailable");
-    smb_client_use_adapter(0);
-    forward_set_store(FORWARD_STORE);   /* edited here, used with an adapter */
-    crash_stage("taking rights");
-    if (tile_elevate() == 0) files_sweep();
-    if (listen_everywhere() != 0) {
-        say("port %d stayed held", TILE_PORT);
-        notify("端口被占用，已退出");
-        return 1;
-    }
-    announce();
-    tile_resume();
+    if (g.native) say("serving on the console's own network");
+    initialize_service();
+    if (g.native && g.elevated) tile_resume();
     crash_stage("serving");
-    while (!__atomic_load_n(&g.stop, __ATOMIC_RELAXED)) {
-        long w, m;
+    usb_lost(mono);
 
-        usleep(NATIVE_TICK_US);
-        w = wall_ms();
-        m = now_ms();
-        if ((w - wall) - (m - mono) > SLEEP_JUMP_MS || local_http_broken()) {
-            say("the listener is restarted: %s", local_http_broken() ? "it failed" : "the console slept");
-            local_http_stop();
-            if (listen_everywhere() != 0) {
-                say("port %d stayed held", TILE_PORT);
-                break;
-            }
-            announce();
+    while (!stopping()) {
+        long w = wall_ms(), m = now_ms();
+
+        if ((w - wall) - (m - mono) > SLEEP_JUMP_MS && g.local != LOCAL_NONE) {
+            if (local_http_close() == 0) g.local = LOCAL_NONE;
+        }
+        if (m - g.native_checked >= NATIVE_CHECK_MS) {
+            refresh_native();
+            g.native_checked = m;
+        }
+        watch_local(m);
+        if (automatic && adapter_watch_ready()) {
+            say("USB recovery: looking for the adapter");
+            checkpoint();
+            g.device_lost = 0;
+            if (adapter_main(run) == 0 && !g.device_lost && g.page == PAGE_USB) break;
+            g.link_up = 0;
+            pthread_mutex_lock(&g_lock);
+            memset(&g.lease, 0, sizeof g.lease);
+            pthread_mutex_unlock(&g_lock);
+            usb_lost(now_ms());
         }
         wall = w;
         mono = m;
+        usleep(NATIVE_TICK_US);
     }
-    files_stop();
-    local_http_stop();
     return 0;
 }
 
+#ifndef INSTANCE_DIR
+#define INSTANCE_DIR APP_DIR "/instance"
+#endif
+
+#ifndef NATIVE_ONLY_FILE
+#define NATIVE_ONLY_FILE APP_DIR "/native-only"
+#endif
+
 int main(void)
 {
-    int result;
+    int result, automatic;
 
     signal(SIGPIPE, SIG_IGN);           /* the loader's socket may already be gone */
+#ifndef INSTANCE_TEST
+    if (mkdir(APP_DIR, 0777) != 0 && errno != EEXIST) {
+        console_line("instance: cannot create application directory: errno %d", errno);
+        return 1;
+    }
+#endif
+    if (instance_acquire(INSTANCE_DIR, 45) != 0) {
+        int saved = errno;
+        FILE *diagnostic = fopen(APP_DIR "/instance-error.txt", "a");
+
+        if (diagnostic) {
+            fprintf(diagnostic, "pid=%ld: %s: errno %d\n", (long)getpid(), instance_failed_at(), saved);
+            fclose(diagnostic);
+        }
+        console_line("instance: %s failed: errno %d", instance_failed_at(), saved);
+        notify("tom usb 无法接管，旧实例可能仍在退出");
+        return 1;
+    }
     if (log_open() != 0) console_line("no log file: errno %d", errno);
     crash_log_start();
     log_firmware();
+#ifdef __SCE__
+    if (syscall(SYS_thr_set_name, -1, "tom-usbnet.elf") != 0)
+        say("could not name the main thread: errno %d", errno);
+#endif
+    say("wake-diag process: pid=%ld", (long)getpid());
+    checkpoint();
     notify("正在启动");
-    result = adapter_main(run);
-    if (result == ADAPTER_NONE) result = run_native();
+    automatic = access(NATIVE_ONLY_FILE, F_OK) != 0;
+    result = automatic ? adapter_main(run) : ADAPTER_NONE;
+    if (!stopping() && (result == ADAPTER_NONE || g.device_lost)) {
+        g.native = !g.initialized && !g.device_lost;
+        g.link_up = 0;
+        pthread_mutex_lock(&g_lock);
+        memset(&g.lease, 0, sizeof g.lease);
+        pthread_mutex_unlock(&g_lock);
+        result = run_fallback(automatic);
+    }
+    if (result == ADAPTER_NONE) result = 0;
+    adapter_watch_close();
+    files_stop();
+    local_http_stop();
     say("stopped");
     checkpoint();
     notify(result || g.native ? "已退出" : adapter_gone ? "网卡失联，已退出，请重新插拔网卡" : "已退出，网卡已恢复");
     log_close();
+    instance_release();
     return result;
 }

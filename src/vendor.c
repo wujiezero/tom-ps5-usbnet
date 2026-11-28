@@ -79,6 +79,7 @@ static struct {
     unsigned tx_failed_run;
     long long tx_failed_since;
     unsigned rx_errors;
+    int device_lost;
     unsigned long errors[ERR_KINDS], tx_done, rx_done;
 } g;
 
@@ -102,7 +103,7 @@ static long long now_ns(void)
 
 static int dead_errno(int code)
 {
-    return code == ENXIO || code == ENODEV || code == EIO || code == EBADF || code == ENOENT;
+    return code == ENOTTY || code == ENXIO || code == ENODEV || code == EIO || code == EBADF || code == ENOENT;
 }
 
 /* One kind filling the log must not hide another, and a failure that goes on for an hour
@@ -134,7 +135,10 @@ static int start_endpoint(int index)
     if (ioctl(g.fd, USB_FS_START, &start) == 0) return 0;
     code = errno;
     note_error(ERR_START, code);
-    if (dead_errno(code)) lose("USB_FS_START errno", code);
+    if (dead_errno(code)) {
+        g.device_lost = 1;
+        lose("USB_FS_START errno", code);
+    }
     return -1;
 }
 
@@ -233,7 +237,10 @@ static int reap(void)
 
             if (code != EBUSY) {
                 note_error(ERR_COMPLETE, code);
-                if (dead_errno(code)) lose("USB_FS_COMPLETE errno", code);
+                if (dead_errno(code)) {
+                    g.device_lost = 1;
+                    lose("USB_FS_COMPLETE errno", code);
+                }
             }
             return taken;
         }
@@ -458,6 +465,26 @@ int vnd_gone(void)
     gone = g.gone;
     pthread_mutex_unlock(&g_lock);
     return gone;
+}
+
+int vnd_device_lost(void)
+{
+    int lost;
+
+    pthread_mutex_lock(&g_lock);
+    lost = g.device_lost;
+    pthread_mutex_unlock(&g_lock);
+    return lost;
+}
+
+void vnd_log_snapshot(void)
+{
+    pthread_mutex_lock(&g_lock);
+    say("wake-diag USB: gone=%d rx_pending=%d rx_ok=%lu tx_pending=%d tx_ok=%lu "
+        "rx_errors=%lu tx_errors=%lu start_errors=%lu complete_errors=%lu",
+        g.gone, g.rx_pending, g.rx_done, g.outstanding, g.tx_done,
+        g.errors[ERR_IN], g.errors[ERR_OUT], g.errors[ERR_START], g.errors[ERR_COMPLETE]);
+    pthread_mutex_unlock(&g_lock);
 }
 
 static size_t next_header(const struct tx_transfer *t)

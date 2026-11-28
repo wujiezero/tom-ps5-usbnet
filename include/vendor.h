@@ -32,6 +32,8 @@ int vnd_start(void);                    /* starts the receive thread */
 void vnd_close(void);
 void vnd_configure(const struct vnd_settings *settings);
 int vnd_gone(void);
+int vnd_device_lost(void);
+void vnd_log_snapshot(void);
 /* Room for one frame of at most MAX_FRAME bytes, or NULL if nothing could be
  * sent in time. A pointer returned here must go to vnd_tx_commit. */
 uint8_t *vnd_tx_reserve(void);

@@ -33,9 +33,10 @@ struct worker {
 };
 
 static struct netif g_netif;
+static struct autoip g_autoip;
 static struct link_ops g_link;
 static uint8_t g_mac[6];
-static int g_up;
+static int g_core_ready, g_attached, g_up;
 static int g_workers;
 static pthread_mutex_t g_workers_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -77,14 +78,26 @@ int net_start(const uint8_t mac[6], const struct link_ops *link)
 
     memcpy(g_mac, mac, sizeof g_mac);
     g_link = *link;
-    net_heap = malloc(MEM_SIZE + 4096);
-    if (!net_heap || sys_sem_new(&ready, 0) != ERR_OK) return -1;
-    tcpip_init(core_ready, &ready);
-    sys_sem_wait(&ready);
-    sys_sem_free(&ready);
+    if (!g_core_ready) {
+        if (sys_sem_new(&ready, 0) != ERR_OK) return -1;
+        net_heap = malloc(MEM_SIZE + 4096);
+        if (!net_heap) {
+            sys_sem_free(&ready);
+            return -1;
+        }
+        tcpip_init(core_ready, &ready);
+        sys_sem_wait(&ready);
+        sys_sem_free(&ready);
+        g_core_ready = 1;
+    }
     LOCK_TCPIP_CORE();
+    memset(&g_netif, 0, sizeof g_netif);
     added = netif_add(&g_netif, IP4_ADDR_ANY4, IP4_ADDR_ANY4, IP4_ADDR_ANY4, NULL, interface_init, ethernet_input);
-    if (added) netif_set_default(added);
+    g_attached = added != NULL;
+    if (added) {
+        autoip_set_struct(added, &g_autoip);
+        netif_set_default(added);
+    }
     UNLOCK_TCPIP_CORE();
     return added ? 0 : -1;
 }
@@ -211,20 +224,37 @@ static void connection_options(int fd)
     lwip_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
 }
 
-int net_serve(const struct http_backend *backend, int (*keep_going)(void))
+const char *net_serve(const struct http_backend *backend, int (*keep_going)(void))
 {
     struct sockaddr_in address;
-    int listener = lwip_socket(AF_INET, SOCK_STREAM, 0), nonblocking = 1, workers;
+    const char *failed = NULL;
+    int listener = lwip_socket(AF_INET, SOCK_STREAM, 0), on = 1, workers;
     u32_t waited;
 
+    if (listener < 0) {
+        int saved = errno;
+        lwip_socket_thread_cleanup();
+        errno = saved;
+        return "socket";
+    }
     memset(&address, 0, sizeof address);
     address.sin_len = sizeof address;
     address.sin_family = AF_INET;
     address.sin_port = lwip_htons(HTTP_PORT);
-    if (listener < 0 || lwip_bind(listener, (struct sockaddr *)&address, sizeof address) < 0 ||
-            lwip_listen(listener, 16) < 0 || lwip_ioctl(listener, FIONBIO, &nonblocking) < 0) {
-        if (listener >= 0) lwip_close(listener);
-        return -1;
+    if (lwip_setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on) < 0)
+        failed = "setsockopt(SO_REUSEADDR)";
+    else if (lwip_bind(listener, (struct sockaddr *)&address, sizeof address) < 0)
+        failed = "bind";
+    else if (lwip_listen(listener, 16) < 0)
+        failed = "listen";
+    else if (lwip_ioctl(listener, FIONBIO, &on) < 0)
+        failed = "ioctl(FIONBIO)";
+    if (failed) {
+        int saved = errno;
+        lwip_close(listener);
+        lwip_socket_thread_cleanup();
+        errno = saved;
+        return failed;
     }
     while (keep_going()) {
         struct sockaddr_in client;
@@ -246,18 +276,26 @@ int net_serve(const struct http_backend *backend, int (*keep_going)(void))
         if (!workers) break;
     }
     lwip_socket_thread_cleanup();
-    return 0;
+    return NULL;
 }
 
 void net_stop(void)
 {
     LOCK_TCPIP_CORE();
+    if (!g_attached) {
+        UNLOCK_TCPIP_CORE();
+        return;
+    }
     dhcp_release_and_stop(&g_netif);
+    dhcp_cleanup(&g_netif);
     autoip_stop(&g_netif);
+    autoip_remove_struct(&g_netif);
     UNLOCK_TCPIP_CORE();
     sys_msleep(RELEASE_FLUSH_MS);
     LOCK_TCPIP_CORE();
     g_up = 0;
     netif_set_down(&g_netif);
+    netif_remove(&g_netif);
+    g_attached = 0;
     UNLOCK_TCPIP_CORE();
 }

@@ -19,7 +19,7 @@ SMB2_SRC := $(wildcard third_party/libsmb2/lib/*.c)
 SMB2_CRYPTO := aes aes_reference aes128ccm hmac usha sha1 sha224-256 sha384-512
 SMB2_CRYPTO_OBJ = $(patsubst %,$(BUILD)/obj/third_party/libsmb2/lib/%.o,$(SMB2_CRYPTO))
 SMB2_FLAGS := -DHAVE_CONFIG_H -Ithird_party/libsmb2 -Ithird_party/libsmb2/include -Ithird_party/libsmb2/include/smb2 -include include/smb_sock.h
-TESTS := $(BUILD)/test-rtl $(BUILD)/test-ncm $(BUILD)/test-files $(BUILD)/test-smb $(BUILD)/test-pkg $(BUILD)/test-crash $(BUILD)/test-forward $(BUILD)/test-app
+TESTS := $(BUILD)/test-rtl $(BUILD)/test-ncm $(BUILD)/test-files $(BUILD)/test-smb $(BUILD)/test-pkg $(BUILD)/test-instance $(BUILD)/test-crash $(BUILD)/test-forward $(BUILD)/test-app
 
 .PHONY: all test sanitize ps5 prepare clean
 all: $(TESTS) $(BUILD)/page-server
@@ -30,6 +30,7 @@ test: all
 	$(BUILD)/test-files
 	$(BUILD)/test-smb
 	$(BUILD)/test-pkg
+	$(BUILD)/test-instance
 	$(BUILD)/test-crash
 	$(BUILD)/test-forward
 	rm -f $(BUILD)/test-nas.txt $(BUILD)/test-forward.txt
@@ -37,6 +38,8 @@ test: all
 	$(BUILD)/test-app 8156b
 	$(BUILD)/test-app 8157
 	$(BUILD)/test-app lost
+	$(BUILD)/test-app replug
+	$(BUILD)/test-app late-usb
 	$(BUILD)/test-app late
 	$(BUILD)/test-app none
 
@@ -44,16 +47,16 @@ src/app_assets.c: web/page.html assets/icon0.png scripts/embed_assets.py
 	$(PYTHON) scripts/embed_assets.py
 
 # The real sources against a simulated adapter, with the lwIP options of the console build.
-NET_SRC := src/net.c src/http_server.c src/app_assets.c src/files.c src/rtl.c src/ncm.c src/local_http.c src/smb.c src/smb_client.c src/smb_net.c \
-           src/smb_lwip.c src/secret.c src/forward.c src/forward_lwip.c src/pkg_stream.c src/pkg_install.c tests/pkg_appinst_stub.c port/sys_arch.c tests/tile_stub.c tests/peer.c tests/forward_services.c
+NET_SRC := src/instance.c src/net.c src/http_server.c src/app_assets.c src/files.c src/rtl.c src/ncm.c src/local_http.c src/smb.c src/smb_client.c src/smb_net.c \
+           src/smb_lwip.c src/secret.c src/forward.c src/forward_http.c src/forward_lwip.c src/pkg_stream.c src/pkg_install.c tests/pkg_appinst_stub.c port/sys_arch.c tests/tile_stub.c tests/peer.c tests/forward_services.c
 NET_OBJ := $(patsubst %.c,$(BUILD)/obj/%.o,$(NET_SRC)) $(patsubst %.c,$(BUILD)/obj/%.o,$(LWIP_SRC)) $(patsubst %.c,$(BUILD)/obj/%.o,$(SMB2_SRC))
 MOCKED := src/main.c src/adapter.c src/vendor.c src/vendor_regs.c tests/test_app.c
 MOCKED_OBJ := $(patsubst %.c,$(BUILD)/mock/%.o,$(MOCKED))
 HOST_FLAGS = $(TEST_PORT) -Iinclude -Iport -Ithird_party/lwip/src/include -Itests -D_POSIX_C_SOURCE=200809L $(EXTRA) $(CFLAGS) -std=gnu11 -pthread
 
+$(BUILD)/obj/src/instance.o: EXTRA := -D_DARWIN_C_SOURCE
 $(BUILD)/obj/src/files.o: EXTRA := -D_DARWIN_C_SOURCE -DFILES_TESTING
-$(BUILD)/mock/src/main.o: EXTRA := -DLINK_WAIT_MS=2000L -Dmain=app_main -DSMB_STORE='"$(BUILD)/test-nas.txt"' -DFORWARD_STORE='"$(BUILD)/test-forward.txt"'
-$(BUILD)/mock/src/adapter.o: EXTRA := -DADAPTER_WAIT_SECONDS=1
+$(BUILD)/mock/src/main.o: EXTRA := -DLINK_WAIT_MS=2000L -Dmain=app_main -DINSTANCE_TEST -DINSTANCE_DIR='"$(BUILD)/instance"' -DSMB_STORE='"$(BUILD)/test-nas.txt"' -DFORWARD_STORE='"$(BUILD)/test-forward.txt"'
 $(BUILD)/mock/tests/test_app.o: EXTRA := -DFORWARD_STORE='"$(BUILD)/test-forward.txt"'
 $(BUILD)/obj/src/local_http.o: EXTRA := -D_DARWIN_C_SOURCE -DLOCAL_HTTP_TESTING
 
@@ -104,13 +107,17 @@ $(BUILD)/test-pkg: $(PKG_TEST) include/pkg_stream.h include/pkg_install.h includ
 	@mkdir -p $(dir $@)
 	$(CC) -Iinclude -D_DARWIN_C_SOURCE -DFILES_TESTING $(CFLAGS) -std=gnu11 -Wall -Wextra -Werror -pthread $(PKG_TEST) -o $@
 
+$(BUILD)/test-instance: src/instance.c tests/test_instance.c include/instance.h
+	@mkdir -p $(dir $@)
+	$(CC) -Iinclude -D_DARWIN_C_SOURCE $(CFLAGS) $(WARN) src/instance.c tests/test_instance.c -o $@
+
 $(BUILD)/test-crash: src/crash.c tests/test_crash.c include/crash.h
 	@mkdir -p $(dir $@)
 	$(CC) -Iinclude $(CFLAGS) -std=c11 -Wall -Wextra -Werror -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE -DCRASH_TESTING src/crash.c tests/test_crash.c -o $@
 
 # The relay with lwIP's side on loopback sockets (tests/forward_fake.c).
-FORWARD_TEST := src/forward.c src/http_server.c src/app_assets.c tests/test_forward.c tests/forward_fake.c tests/forward_services.c
-$(BUILD)/test-forward: $(FORWARD_TEST) include/forward.h include/forward_lwip.h include/http_server.h
+FORWARD_TEST := src/forward.c src/forward_http.c src/http_server.c src/app_assets.c tests/test_forward.c tests/forward_fake.c tests/forward_services.c
+$(BUILD)/test-forward: $(FORWARD_TEST) include/forward.h include/forward_http.h include/forward_lwip.h include/http_server.h
 	@mkdir -p $(dir $@)
 	$(CC) -Iinclude -D_DARWIN_C_SOURCE $(CFLAGS) -std=gnu11 -Wall -Wextra -Werror -pthread $(FORWARD_TEST) -o $@
 
@@ -118,7 +125,7 @@ $(BUILD)/test-app: $(MOCKED_OBJ) $(NET_OBJ)
 	$(CC) $(CFLAGS) -pthread $^ -o $@
 
 # For walking the page in a real browser.
-PAGE_SERVER := tests/page_server.c src/files.c src/http_server.c src/app_assets.c src/smb.c src/pkg_install.c src/pkg_stream.c tests/pkg_appinst_stub.c tests/smb_fake.c src/forward.c tests/forward_fake.c
+PAGE_SERVER := tests/page_server.c src/files.c src/http_server.c src/app_assets.c src/smb.c src/pkg_install.c src/pkg_stream.c tests/pkg_appinst_stub.c tests/smb_fake.c src/forward.c src/forward_http.c tests/forward_fake.c
 $(BUILD)/page-server: $(PAGE_SERVER) include/files.h include/http_server.h include/smb.h include/smb_client.h include/pkg_install.h include/pkg_stream.h include/pkg_appinst.h include/forward.h $(BUILD)/obj/src/secret.o $(SMB2_CRYPTO_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) -Iinclude -D_DARWIN_C_SOURCE -DFILES_TESTING $(CFLAGS) -std=gnu11 -Wall -Wextra -Werror -pthread $(PAGE_SERVER) $(BUILD)/obj/src/secret.o $(SMB2_CRYPTO_OBJ) -o $@

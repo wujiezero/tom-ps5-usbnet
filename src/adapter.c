@@ -4,10 +4,14 @@
 #include "adapter.h"
 #include "log.h"
 
-#include <sys/ioctl.h>
-#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
+#ifdef __SCE__
+#include <sys/event.h>
+#endif
+#include <sys/stat.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -18,8 +22,6 @@
 
 #define CONFIG_WAIT_MS 5000
 #define DRIVER_PROBE_MS 500
-#define N_BUS 8
-#define N_ADDR 32
 #define MAX_CONFIGS 8
 #define CONFIG_BYTES 2048
 #define UNCONFIGURED 0xff
@@ -143,24 +145,102 @@ static int probe_node(const char *path, struct adapter *a)
     return found;
 }
 
-static int find_adapter(struct adapter *a)
+/* Only endpoint zero names identify devices. The ugen alias addresses the whole device. */
+static uint64_t scan_nodes(struct adapter *a)
 {
-    char path[32];
-    long end = now_ms() + ADAPTER_WAIT_SECONDS * 1000L;
-    int bus, addr;
+    uint64_t snapshot = 0;
+#ifdef MOCK_ADAPTER_H
+    struct stat st;
+    const char *path = "/dev/ugen2.2";
 
-    do {
-        for (bus = 0; bus < N_BUS; bus++)
-            for (addr = 2; addr < N_ADDR; addr++) {
-                int found;
+    if (stat(path, &st) == 0) {
+        snapshot = 1;
+        if (a) probe_node(path, a);
+    }
+#else
+    DIR *directory = opendir("/dev/usb");
+    struct dirent *entry;
 
-                snprintf(path, sizeof path, "/dev/ugen%d.%d", bus, addr);
-                found = probe_node(path, a);
-                if (found) return found > 0 ? 0 : -1;
-            }
-        sleep(1);
-    } while (now_ms() < end);
-    return -1;
+    if (!directory) return 0;
+    while ((entry = readdir(directory)) != NULL) {
+        unsigned bus, address, endpoint;
+        char trailing, path[32];
+
+        if (sscanf(entry->d_name, "%u.%u.%u%c", &bus, &address, &endpoint, &trailing) != 3 ||
+                endpoint != 0 || address < 2)
+            continue;
+        snapshot ^= ((uint64_t)(bus + 1) << 32 | address) * UINT64_C(0x9e3779b97f4a7c15);
+        if (a) {
+            snprintf(path, sizeof path, "/dev/ugen%u.%u", bus, address);
+            if (probe_node(path, a) > 0) break;
+            a->ecm_index = -1;
+            a->original_index = UNCONFIGURED;
+        }
+    }
+    closedir(directory);
+#endif
+    return snapshot;
+}
+
+#ifdef __SCE__
+static int watch_fd = -1, watch_directory = -1;
+
+static void open_watch(void)
+{
+    struct kevent change;
+
+    watch_directory = open("/dev/usb", O_RDONLY | O_CLOEXEC);
+    if (watch_directory < 0) return;
+    watch_fd = kqueue();
+    if (watch_fd >= 0) {
+        EV_SET(&change, watch_directory, EVFILT_VNODE, EV_ADD | EV_CLEAR,
+            NOTE_WRITE | NOTE_ATTRIB | NOTE_LINK, 0, NULL);
+        if (kevent(watch_fd, &change, 1, NULL, 0, NULL) == 0) return;
+    }
+    adapter_watch_close();
+}
+
+void adapter_watch_close(void)
+{
+    if (watch_fd >= 0) close(watch_fd);
+    if (watch_directory >= 0) close(watch_directory);
+    watch_fd = watch_directory = -1;
+}
+#else
+void adapter_watch_close(void) {}
+#endif
+
+int adapter_watch_ready(void)
+{
+    static uint64_t previous;
+    static long next_check, next_probe;
+    static int started;
+    long t = now_ms();
+    int event = 0;
+    uint64_t current;
+
+#ifdef __SCE__
+    if (!started) open_watch();
+    if (watch_fd >= 0) {
+        struct timespec immediate = {0, 0};
+        struct kevent change;
+
+        event = kevent(watch_fd, NULL, 0, &change, 1, &immediate);
+        if (event < 0 || (event > 0 && (change.flags & EV_ERROR))) {
+            adapter_watch_close();
+            event = 0;
+        }
+    }
+#endif
+    if (!event && t < next_check) return 0;
+    next_check = t + 2000;
+    current = scan_nodes(NULL);
+    if (started && current == previous && !event && t < next_probe) return 0;
+    started = 1;
+    previous = current;
+    /* A device can exist before its descriptor is readable. Recheck at a low rate. */
+    next_probe = t + 30000;
+    return current != 0;
 }
 
 /* USB_SET_CONFIG only queues the change, and the node may be recreated. */
@@ -283,12 +363,16 @@ int adapter_read_mac(struct adapter *a, uint8_t mac[6])
 
 int adapter_main(void (*run)(struct adapter *adapter))
 {
-    static struct adapter a;
+    struct adapter a = {0};
+
+    adapter_gone = 0;
 
     a.fd = -1;
     a.original_index = UNCONFIGURED;
     a.ecm_index = -1;
-    if (find_adapter(&a) != 0) {
+    g_seen_count = 0;
+    scan_nodes(&a);
+    if (!a.path[0]) {
         say("no supported adapter found");
         log_seen();
         return ADAPTER_NONE;

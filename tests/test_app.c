@@ -70,6 +70,8 @@ static struct {
     unsigned long rx_dropped, aggregates, largest, multi_frame_transfers, writes;
     uint32_t regs[2][0x4000], bmu;
     int configs_seen[4], fs_uninit, resets, absent;
+    int simulate_unplug, unplugged;
+    long replug_at;
     int out_starts, out_reset_due, out_resets, out_dead, out_failed;
     enum rtl_chip chip;
     long link_at, link_delay;
@@ -231,7 +233,7 @@ static void send_aggregate(int i)
 int mock_stat(const char *path, struct stat *st)
 {
     (void)st;
-    return m.absent || strcmp(path, "/dev/ugen2.2") ? fail(ENOENT) : 0;
+    return m.absent || now() < m.replug_at || strcmp(path, "/dev/ugen2.2") ? fail(ENOENT) : 0;
 }
 
 int mock_open(const char *path, int flags, ...)
@@ -491,6 +493,14 @@ static int device_ioctl(unsigned long request, void *arg)
     case USB_FS_START:
         return fs_start(arg);
     case USB_FS_COMPLETE:
+        if (m.simulate_unplug && !m.unplugged) {
+            m.unplugged = 1;
+            m.replug_at = now() + 2500;
+            m.fs_active = 0;
+            m.rx_count = m.done_count = 0;
+            memset(m.opened, 0, sizeof m.opened);
+            return fail(ENOTTY);
+        }
         return fs_complete(arg);
     case USB_FS_UNINIT:
         m.fs_active = 0;
@@ -520,7 +530,12 @@ int log_open(void) { return 0; }
 void log_close(void) {}
 void log_firmware(void) {}
 void checkpoint(void) {}
-void notify(const char *text) { snprintf(last_notify, sizeof last_notify, "%s", text); }
+static int fallback_notices;
+void notify(const char *text)
+{
+    if (strstr(text, "改用主机网络：") || strstr(text, "使用主机网络：")) fallback_notices++;
+    snprintf(last_notify, sizeof last_notify, "%s", text);
+}
 
 void console_line(const char *fmt, ...)
 {
@@ -673,6 +688,7 @@ static int console_id(uint8_t id[16])
 int main(int argc, char **argv)
 {
     int cable[2], size = 1 << 20, status, code, late = argc > 1 && !strcmp(argv[1], "late");
+    int late_usb = argc > 1 && !strcmp(argv[1], "late-usb");
     char files_root[64];
     pthread_t watcher;
     pid_t child;
@@ -682,8 +698,10 @@ int main(int argc, char **argv)
     secret_set_source(console_id);
     alarm(120);
     m.chip = argc > 1 && !strcmp(argv[1], "8156b") ? RTL_8156B : argc > 1 && !strcmp(argv[1], "8157") ? RTL_8157 : RTL_8159;
+    m.simulate_unplug = argc > 1 && !strcmp(argv[1], "replug");
     m.out_dead = argc > 1 && !strcmp(argv[1], "lost");
     m.link_delay = late ? NO_LINK : 300;
+    if (late_usb) m.replug_at = now() + 3000;
     snprintf(files_root, sizeof files_root, "/tmp/tom-usbnet-files-%d", (int)getpid());
     assert(mkdir(files_root, 0700) == 0);
     peer_files_root = files_test_root = files_root;
@@ -764,13 +782,25 @@ int main(int argc, char **argv)
         assert(strstr(report, "no Ethernet link") && strstr(report, "page on the console's own network"));
         assert(strstr(report, "local page: listening on every address") && strstr(report, "page back on the adapter"));
         assert(strstr(report, "page on the console's own network") < strstr(report, "address from dhcp"));
+    } else if (m.simulate_unplug) {
+        assert(m.unplugged && strstr(report, "adapter lost: USB_FS_COMPLETE errno 25"));
+        const char *scan = strstr(report, "USB recovery: looking for the adapter");
+        assert(scan && !strstr(scan + 1, "USB recovery: looking for the adapter"));
+        assert(fallback_notices == 1);
+        assert(strstr(report, "local page: listening on every address"));
+        assert(strstr(report, "page back on the adapter"));
+    } else if (late_usb) {
+        assert(strstr(report, "no supported adapter found"));
+        assert(strstr(report, "local page: listening on every address"));
+        assert(strstr(report, "page back on the adapter"));
+        assert(fallback_notices == 1);
     } else {
         assert(!strstr(report, "no Ethernet link") && !strstr(report, "console's own network"));
     }
     /* One bulk OUT failed: it is said, the endpoint is reset once, and the run goes on. */
     assert(m.out_starts > FAIL_OUT_AT && m.out_resets == 1);
     assert(strstr(report, "bulk OUT status: 18") && strstr(report, "bulk OUT works again after 1 failures"));
-    assert(strstr(report, " ok, 1 failed; in ") && !strstr(report, "adapter lost"));
+    assert(strstr(report, " ok, 1 failed; in ") && (m.simulate_unplug || !strstr(report, "adapter lost")));
     assert(strstr(report, "chip counters: rx ") && strstr(report, "serving ended: asked to stop"));
     assert(!strstr(report, "link status unreadable") && !strstr(report, "link down"));
     assert(strstr(report, "NAS password key ready"));
@@ -786,8 +816,9 @@ int main(int argc, char **argv)
     assert(strstr(last_notify, "已恢复"));
     fprintf(stderr, "mock: %lu register writes, largest aggregate %lu frames, %lu frames dropped\n", m.writes, m.largest, m.rx_dropped);
     assert(m.multi_frame_transfers > 0 && m.largest > 1 && m.writes > 20);
-    assert(m.fs_uninit == 1 && m.configs_seen[2] == 1 && m.configs_seen[0] == 1 && m.config == 0 && m.alt == 0);
-    assert(tile_calls[0] == 1 && tile_calls[1] == 1);
+    assert(m.fs_uninit == 1 && m.configs_seen[2] == 1 + m.simulate_unplug &&
+        m.configs_seen[0] == 1 + m.simulate_unplug && m.config == 0 && m.alt == 0);
+    assert(tile_calls[0] == 1 && tile_calls[1] == 1 + late_usb);
     assert(rmdir(files_root) == 0);     /* the peer deleted what it uploaded */
     printf("end-to-end test passed: %s%s\n", m.chip == RTL_8156B ? "RTL8156B" : m.chip == RTL_8157 ? "RTL8157" : "RTL8159",
         late ? ", the cable in late" : "");

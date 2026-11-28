@@ -3,6 +3,7 @@
  * relay itself, with lwIP's side on loopback sockets (tests/forward_fake.c) in front of
  * the services in tests/forward_services.c. test_app.c runs it again through lwIP. */
 #include "forward.h"
+#include "forward_http.h"
 #include "http_server.h"
 
 #include <arpa/inet.h>
@@ -365,6 +366,43 @@ static void relay(void)
     CHECK(call("GET", "/fwd/rules", NULL, reply, sizeof reply) == 200 && strstr(reply, "\"running\":false"));
 }
 
+static void upload_web_headers(void)
+{
+    const char *requests[] = {
+        "GET / HTTP/1.1\r\nHost: 192.168.31.67:9180\r\nConnection: keep-alive\r\n\r\n",
+        ("POST /api/upload HTTP/1.1\r\nHost: 192.168.31.67:9180\r\nOrigin: http://192.168.31.67:9180\r\n"
+            "X-Token: test-token\r\nContent-Length: 4294967296\r\n\r\n"),
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:9180\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: 192.168.31.67:9180\r\nOrigin: http://another-site.example\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: 192.168.31.67:9180\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: 192.168.31.67:9180\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: 192.168.31.67:9180\r\nHost: 192.168.31.67:9180\r\n\r\n"
+    };
+    char output[512];
+    uint64_t body;
+    size_t i;
+
+    for (i = 0; i < sizeof requests / sizeof requests[0]; i++) {
+        int n = forward_http_head(requests[i], strlen(requests[i]), "192.168.31.67:9180",
+                                 "192.168.31.66:9180", output, sizeof output - 1, &body);
+
+        if (i >= 2) {
+            CHECK(n < 0);
+            continue;
+        }
+        CHECK(n > 0);
+        output[n] = 0;
+        CHECK(strstr(output, "Host: 192.168.31.66:9180\r\n"));
+        CHECK(strstr(output, "Connection: close\r\n\r\n"));
+        CHECK(!strstr(output, "192.168.31.67"));
+        CHECK(body == (i ? UINT64_C(4294967296) : 0));
+        if (i) {
+            CHECK(strstr(output, "Origin: http://192.168.31.66:9180\r\n"));
+            CHECK(strstr(output, "X-Token: test-token\r\n"));
+        }
+    }
+}
+
 int main(void)
 {
     char store[64];
@@ -372,6 +410,7 @@ int main(void)
     signal(SIGPIPE, SIG_IGN);
     alarm(60);
     snprintf(store, sizeof store, "/tmp/tom-forward-%d.txt", (int)getpid());
+    upload_web_headers();
     passive();
     routes(store);
     relay();
