@@ -723,6 +723,13 @@ static void copy_file(struct job *j, const char *path, const char *to, const str
         smb_close_file(j->session, file);
         return;
     }
+    if (files_ensure_0777(part, fd) != 0) {
+        j->local = errno;
+        close(fd);
+        unlink(part);
+        smb_close_file(j->session, file);
+        return;
+    }
     while (!stopped(j)) {
         long long n = smb_read(j->session, file, j->buffer[which], j->chunk, offset);
 
@@ -746,6 +753,7 @@ static void copy_file(struct job *j, const char *path, const char *to, const str
     if (!j->error && !j->local && offset >= SYNC_FROM && fsync(fd) != 0) j->local = errno;
     if (close(fd) != 0 && !j->error && !j->local) j->local = errno;
     if (!j->error && !j->local && rename(part, to) != 0) j->local = errno;
+    if (!j->error && !j->local && files_ensure_0777(to, -1) != 0) j->local = errno;
     if (j->error || j->local) unlink(part);
 }
 
@@ -764,9 +772,18 @@ static void copy_tree(struct job *j, const char *path, const char *to, const str
         j->local = ENAMETOOLONG;
         return;
     }
-    if (mkdir(to, 0777) != 0 && errno != EEXIST) {
-        j->local = errno;
-        return;
+    {
+        int made = mkdir(to, 0777);
+
+        if (made != 0 && errno != EEXIST) {
+            j->local = errno;
+            return;
+        }
+        if (made == 0 && files_ensure_0777(to, -1) != 0) {
+            j->local = errno;
+            rmdir(to);
+            return;
+        }
     }
     if ((j->error = smb_opendir(j->session, path, &dir)) != 0) return;
     inner = malloc(PATH_BYTES);

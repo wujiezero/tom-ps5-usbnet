@@ -5,6 +5,7 @@
  * console is a kernel socket to 127.0.0.1, so a service there sees every client as
  * the console itself. Nothing here logs an address. */
 #include "forward.h"
+#include "forward_http.h"
 #include "forward_lwip.h"
 #include "log.h"
 #include "tile.h"
@@ -73,6 +74,7 @@ struct link {
     int ftp;                            /* -1 until the service's first bytes say */
     uint32_t peer, target;
     uint16_t to;
+    uint32_t http_address;             /* only the explicit 9180 → 9180 rule */
     int dead, refs, inner_done;
     size_t line_used;
     char line[LINE_BYTES];
@@ -488,14 +490,76 @@ static int deliver(struct link *l, const char *data, size_t n)
     return 0;
 }
 
+static int proxy_request(struct link *l, char *buffer, uint64_t *remaining)
+{
+    char external[32], upstream[32], ip[INET_ADDRSTRLEN], output[FORWARD_HTTP_HEAD];
+    size_t used = 0, head = 0;
+    long deadline = now_ms() + 10000;
+    int n;
+
+    if (!inet_ntop(AF_INET, &l->http_address, ip, sizeof ip)) return -1;
+    snprintf(external, sizeof external, "%s:%u", ip, (unsigned)l->owner);
+    if (!inet_ntop(AF_INET, &l->target, ip, sizeof ip)) return -1;
+    snprintf(upstream, sizeof upstream, "%s:%u", ip, (unsigned)l->to);
+
+    while (used < FORWARD_HTTP_HEAD && now_ms() < deadline && !gone(l)) {
+        size_t i = used > 3 ? used - 3 : 0;
+        long got = fwd_lwip_read(l->outer, buffer + used, FORWARD_HTTP_HEAD - used);
+
+        if (got == FWD_LWIP_TIMEOUT) continue;
+        if (got <= 0) return -1;
+        used += (size_t)got;
+        for (; i + 4 <= used; i++)
+            if (!memcmp(buffer + i, "\r\n\r\n", 4)) {
+                head = i + 4;
+                break;
+            }
+        if (head) break;
+    }
+    if (head) {
+        n = forward_http_head(buffer, head, external, upstream, output, sizeof output, remaining);
+        if (n >= 0 && used - head <= *remaining) {
+            if (inner_send(l, output, (size_t)n) != 0 ||
+                    inner_send(l, buffer + head, used - head) != 0) return -1;
+            *remaining -= used - head;
+            account(l->owner, used, 0);
+            return 0;
+        }
+    }
+    {
+        static const char rejected[] =
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+        outer_send(l, rejected, sizeof rejected - 1);
+        fwd_lwip_shutdown(l->outer);
+    }
+    return -1;
+}
+
 static void *outward_main(void *opaque)
 {
     struct link *l = opaque;
     char *buffer = malloc(BUFFER_BYTES);
     int idle = 0;
+    uint64_t remaining = UINT64_MAX;
 
+    if (l->http_address && buffer && proxy_request(l, buffer, &remaining) != 0) {
+        free(buffer);
+        shutdown(l->inner, SHUT_RDWR);
+        release(l);
+        return NULL;
+    }
     while (buffer) {
-        long n = fwd_lwip_read(l->outer, buffer, BUFFER_BYTES);
+        size_t capacity = remaining < BUFFER_BYTES ? (size_t)remaining : BUFFER_BYTES;
+        long n;
+
+        if (!capacity) {
+            shutdown(l->inner, SHUT_WR);
+            free(buffer);
+            release(l);
+            return NULL;
+        }
+        n = fwd_lwip_read(l->outer, buffer, capacity);
 
         if (n > 0) {
             idle = 0;
@@ -504,6 +568,7 @@ static void *outward_main(void *opaque)
                 break;
             }
             account(l->owner, (uint64_t)n, 0);
+            if (l->http_address) remaining -= (uint64_t)n;
             continue;
         }
         if (n == FWD_LWIP_TIMEOUT) {
@@ -578,13 +643,36 @@ static int spawn(void *(*main)(void *), void *argument)
     return result;
 }
 
+/* Ask the host stack which local address it uses to reach this client. UDP
+ * connect selects a route without sending a packet. Never fall back to loopback:
+ * the upstream service's LAN-only listener policy must still apply. */
+static uint32_t native_target(const struct link *l)
+{
+    struct sockaddr_in peer = {0}, local = {0};
+    socklen_t length = sizeof local;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (fd < 0) return 0;
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(l->owner);
+    peer.sin_addr.s_addr = l->peer;
+    if (connect(fd, (struct sockaddr *)&peer, sizeof peer) != 0 ||
+            getsockname(fd, (struct sockaddr *)&local, &length) != 0)
+        local.sin_addr.s_addr = 0;
+    close(fd);
+    if ((ntohl(local.sin_addr.s_addr) >> 24) == 127 || local.sin_addr.s_addr == l->http_address)
+        return 0;
+    return local.sin_addr.s_addr;
+}
+
 /* Connects to the service, then carries what it sends back to the client. */
 static void *inward_main(void *opaque)
 {
     struct link *l = opaque;
     char *buffer;
 
-    l->inner = inner_connect(l->target, l->to);
+    if (l->http_address) l->target = native_target(l);
+    l->inner = l->target ? inner_connect(l->target, l->to) : -1;
     if (l->inner < 0) {
         fwd_lwip_close(l->outer, 1);    /* the client sees the refusal the service gave */
         account(l->owner, 0, 1);
@@ -716,6 +804,7 @@ static int take(int slot)
             k->target = htonl(INADDR_LOOPBACK);
             k->to = r->to;
             k->owner = r->port;
+            if (r->port == 9180 && r->to == 9180) k->http_address = g_address;
         } else {
             free(k);
             k = NULL;
@@ -735,7 +824,7 @@ static int take(int slot)
     k->outer = fd;
     k->inner = -1;
     k->peer = peer;
-    k->ftp = -1;
+    k->ftp = k->http_address ? 0 : -1;
     if (spawn(inward_main, k) != 0) {
         fwd_lwip_close(fd, 1);
         account(k->owner, 0, 1);

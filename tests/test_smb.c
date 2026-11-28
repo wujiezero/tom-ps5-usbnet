@@ -313,6 +313,14 @@ static void browsing(void)
     CHECK(smb_fake_sessions == 0);
 }
 
+static mode_t mode_of(const char *path)
+{
+    struct stat st;
+
+    CHECK(stat(path, &st) == 0);
+    return st.st_mode & 0777;
+}
+
 static void copies(void)
 {
     char a[600], b[600], target[2048];
@@ -321,8 +329,28 @@ static void copies(void)
     snprintf(a, sizeof a, "%s/media/sub/deep/c.txt", g_nas);
     snprintf(b, sizeof b, "%s/sub/deep/c.txt", g_volume);
     CHECK(same(a, b));
+    snprintf(b, sizeof b, "%s/sub", g_volume);
+    CHECK(mode_of(b) == 0777);
+    snprintf(b, sizeof b, "%s/sub/deep", g_volume);
+    CHECK(mode_of(b) == 0777);
+    snprintf(b, sizeof b, "%s/sub/deep/c.txt", g_volume);
+    CHECK(mode_of(b) == 0777);
     snprintf(b, sizeof b, "%s/sub/empty", g_volume);
     CHECK(exists(b));
+    CHECK(mode_of(b) == 0777);
+    /* The same tree with a restrictive umask: chmod/fchmod must still win. */
+    {
+        mode_t old = umask(077);
+
+        copy("sub", "sub077", 200, "\"state\":\"done\"");
+        umask(old);
+    }
+    snprintf(b, sizeof b, "%s/sub077", g_volume);
+    CHECK(mode_of(b) == 0777);
+    snprintf(b, sizeof b, "%s/sub077/deep", g_volume);
+    CHECK(mode_of(b) == 0777);
+    snprintf(b, sizeof b, "%s/sub077/deep/c.txt", g_volume);
+    CHECK(mode_of(b) == 0777);
     CHECK(simple("GET", "/fs/job", NULL, "\"kind\":\"smb\"") == 200);
     CHECK(simple("GET", "/fs/transfers", NULL, "\"name\":\"sub\"") == 200);
     copy("sub", "sub", 409, NULL);      /* it is there now */
@@ -330,8 +358,21 @@ static void copies(void)
     snprintf(a, sizeof a, "%s/media/a.bin", g_nas);
     snprintf(b, sizeof b, "%s/a.bin", g_volume);
     CHECK(same(a, b));
+    CHECK(mode_of(b) == 0777);
     snprintf(b, sizeof b, "%s/a.bin.tom-part", g_volume);
     CHECK(!exists(b));
+    /* A single file with a restrictive umask. */
+    snprintf(a, sizeof a, "%s/media/perm.bin", g_nas);
+    put(a, 4096, 9);
+    {
+        mode_t old = umask(077);
+
+        copy("perm.bin", "perm.bin", 200, "\"state\":\"done\"");
+        umask(old);
+    }
+    snprintf(b, sizeof b, "%s/perm.bin", g_volume);
+    CHECK(mode_of(b) == 0777);
+    snprintf(a, sizeof a, "%s/media/a.bin", g_nas);
     copy("", "all", 200, "\"state\":\"done\"");          /* the share itself */
     snprintf(b, sizeof b, "%s/all/a.bin", g_volume);
     CHECK(same(a, b));

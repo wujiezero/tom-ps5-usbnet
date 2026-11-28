@@ -9,11 +9,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* How long the bus is watched for an adapter before the page goes on the console's own
- * network instead. A replugged adapter takes a few seconds to come back. */
-#ifndef ADAPTER_WAIT_SECONDS
-#define ADAPTER_WAIT_SECONDS 10
-#endif
+/* Polls notifications where supported, otherwise compares snapshots of actual nodes. */
+int adapter_watch_ready(void);
+void adapter_watch_close(void);
 #define ADAPTER_NONE 2                  /* adapter_main(): none, or none it can use */
 
 extern int adapter_gone;

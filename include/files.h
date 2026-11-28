@@ -12,6 +12,10 @@ int files_route(const struct http_request *request, struct http_stream *stream);
 void files_set_log(void (*log)(const char *line));
 /* Whether `path` is one the routes accept. */
 int files_path_allowed(const char *path);
+/* Ensures a newly created file or directory is observable as 0777. Pass the
+ * open descriptor for a file, or -1 to chmod/stat `path`. A chmod that the
+ * filesystem does not support is accepted only when stat already shows 0777. */
+int files_ensure_0777(const char *path, int fd);
 /* Asks the running job to stop; waits for it. */
 void files_stop(void);
 /* Removes the disk test's file, left by a run that did not end. */

@@ -28,6 +28,7 @@ int net_up(void);
 /* The address the interface has now. Returns 0 if there is one. */
 int net_address(struct net_lease *lease);
 /* Serves until keep_going() returns 0. */
-int net_serve(const struct http_backend *backend, int (*keep_going)(void));
+/* Returns the failed listener operation, or NULL after the service stops. */
+const char *net_serve(const struct http_backend *backend, int (*keep_going)(void));
 void net_stop(void);
 #endif

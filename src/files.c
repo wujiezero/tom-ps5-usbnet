@@ -150,6 +150,28 @@ int files_path_allowed(const char *path)
     return 1;
 }
 
+/* The umask applies to open()/mkdir(), so setting 0777 once at creation is not
+ * enough. chmod (or fchmod) overrides it; if the filesystem cannot store POSIX
+ * modes (exFAT), accept the result only when stat already reports 0777. */
+int files_ensure_0777(const char *path, int fd)
+{
+    struct stat st;
+    int changed, saved;
+
+    if (fd >= 0) {
+        changed = fchmod(fd, 0777);
+        saved = errno;
+        if (fstat(fd, &st) != 0) return -1;
+    } else {
+        changed = chmod(path, 0777);
+        saved = errno;
+        if (stat(path, &st) != 0) return -1;
+    }
+    if ((st.st_mode & 0777) == 0777) return 0;
+    errno = changed ? saved : EPERM;
+    return -1;
+}
+
 /* Every part below the volume, the last one too if it exists, is no symbolic link. */
 static int no_links(const char *path)
 {
@@ -385,6 +407,13 @@ static int make_folder(const struct http_request *r, struct http_stream *stream)
 
     if (query_path(r, "path", path) != 0 || is_volume(path)) return error(stream, 400, "bad_path");
     if (mkdir(path, 0777) != 0) return fail(stream);
+    if (files_ensure_0777(path, -1) != 0) {
+        int code = errno;
+
+        rmdir(path);
+        errno = code;
+        return fail(stream);
+    }
     return reply(stream, 200, "{}");
 }
 
@@ -685,13 +714,14 @@ static int upload(const struct http_request *r, struct http_stream *stream)
     uint64_t total = 0;
     long started = now_ms(), written, sync_ms = 0;
     char *slash;
-    int fd, code;
+    int fd, code, existed = 0;
 
     if (query_path(r, "path", path) != 0 || is_volume(path)) return error(stream, 400, "bad_path");
     if (!r->has_length) return error(stream, 400, "length_required");
     if (lstat(path, &st) == 0) {
         if (S_ISDIR(st.st_mode)) return error(stream, 409, "is_folder");
         if (!http_query_flag(r->query, "overwrite")) return error(stream, 409, "exists");
+        existed = 1;
     }
     snprintf(parent, sizeof parent, "%s", path);
     slash = strrchr(parent, '/');
@@ -700,6 +730,13 @@ static int upload(const struct http_request *r, struct http_stream *stream)
     snprintf(part, sizeof part, "%s" PART_SUFFIX, path);
     fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return fail(stream);
+    if (files_ensure_0777(part, fd) != 0) {
+        code = errno;
+        close(fd);
+        unlink(part);
+        errno = code;
+        return fail(stream);
+    }
     client_of(r, client);
     t = transfer_begin("upload", path, client, r->length);
     if (receive(r, stream, fd, &total, t, path) != 0) {
@@ -734,6 +771,13 @@ static int upload(const struct http_request *r, struct http_stream *stream)
             errno = code;
             return fail(stream);
         }
+    }
+    if (files_ensure_0777(path, -1) != 0) {
+        code = errno;
+        if (!existed) unlink(path);
+        transfer_end(t, "failed");
+        errno = code;
+        return fail(stream);
     }
     transfer_end(t, "done");
     note_transfer("upload", path, total, written, sync_ms);
@@ -997,6 +1041,14 @@ static int copy_file(const char *from, const char *to, const struct stat *st, ui
         errno = code;
         return -1;
     }
+    if (files_ensure_0777(part, out) != 0) {
+        code = errno;
+        close(out);
+        close(in);
+        unlink(part);
+        errno = code;
+        return -1;
+    }
     for (;;) {
         ssize_t n = read(in, buffer, IO_BYTES);
 
@@ -1017,6 +1069,7 @@ static int copy_file(const char *from, const char *to, const struct stat *st, ui
     close(out);
     close(in);
     if (!code && rename(part, to) != 0) code = errno;
+    if (!code && files_ensure_0777(to, -1) != 0) code = errno;
     if (code) {
         unlink(part);
         errno = code;
@@ -1044,7 +1097,18 @@ static int copy_tree(const char *from, const char *to, int depth, uint8_t *buffe
         errno = ENAMETOOLONG;
         return -1;
     }
-    if (mkdir(to, 0777) != 0 && errno != EEXIST) return -1;
+    {
+        int made = mkdir(to, 0777);
+
+        if (made != 0 && errno != EEXIST) return -1;
+        if (made == 0 && files_ensure_0777(to, -1) != 0) {
+            int code = errno;
+
+            rmdir(to);
+            errno = code;
+            return -1;
+        }
+    }
     d = opendir(from);
     if (!d) return -1;
     while (!result && (e = readdir(d)) != NULL) {

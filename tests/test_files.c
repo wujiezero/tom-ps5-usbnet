@@ -160,6 +160,16 @@ static long size_of(const char *path)
     return stat(full, &st) == 0 ? (long)st.st_size : -1;
 }
 
+static mode_t mode_of(const char *path)
+{
+    char full[1024];
+    struct stat st;
+
+    snprintf(full, sizeof full, "%s%s", g_root, path);
+    CHECK(stat(full, &st) == 0);
+    return st.st_mode & 0777;
+}
+
 static void wait_job(const char *state)
 {
     int i;
@@ -391,6 +401,82 @@ static void jobs(void)
     CHECK(simple("POST", url) == 404);
 }
 
+static void permission_case(const char *tag, mode_t mask)
+{
+    char url[4096], dir[64], path[192];
+    char *body = NULL;
+    size_t length;
+    mode_t old = umask(mask);
+
+    snprintf(dir, sizeof dir, "/perm-%s", tag);
+    target(url, sizeof url, "/fs/mkdir", "path", dir);
+    CHECK(simple("POST", url) == 200);
+    CHECK(mode_of(dir) == 0777);
+
+    snprintf(path, sizeof path, "%s/u.bin", dir);
+    target(url, sizeof url, "/fs/put", "path", path);
+    CHECK(request_full("POST", url, "x", 1, 1, NULL, &body, &length) == 200);
+    free(body);
+    body = NULL;
+    CHECK(mode_of(path) == 0777);
+
+    snprintf(path, sizeof path, "%s/src.bin", dir);
+    write_local(path, "x");
+    {
+        char from[192], to[192];
+
+        snprintf(from, sizeof from, "%s/src.bin", dir);
+        snprintf(to, sizeof to, "%s/copy.bin", dir);
+        target2(url, sizeof url, "/fs/copy", from, to);
+        CHECK(simple("POST", url) == 200);
+        wait_job("\"state\":\"done\"");
+        CHECK(mode_of(to) == 0777);
+    }
+
+    {
+        char tree[192], tree2[192], file[192];
+
+        snprintf(tree, sizeof tree, "%s/tree", dir);
+        target(url, sizeof url, "/fs/mkdir", "path", tree);
+        CHECK(simple("POST", url) == 200);
+        CHECK(mode_of(tree) == 0777);
+        snprintf(file, sizeof file, "%s/a.txt", tree);
+        target(url, sizeof url, "/fs/put", "path", file);
+        CHECK(request_full("POST", url, "x", 1, 1, NULL, &body, &length) == 200);
+        free(body);
+        body = NULL;
+        snprintf(tree2, sizeof tree2, "%s/tree2", dir);
+        target2(url, sizeof url, "/fs/copy", tree, tree2);
+        CHECK(simple("POST", url) == 200);
+        wait_job("\"state\":\"done\"");
+        CHECK(mode_of(tree2) == 0777);
+        snprintf(file, sizeof file, "%s/tree2/a.txt", dir);
+        CHECK(mode_of(file) == 0777);
+    }
+    umask(old);
+}
+
+static void permissions(void)
+{
+    permission_case("022", 022);
+    permission_case("077", 077);
+}
+
+/* A file whose mode cannot be changed must make the helper fail, not report 0777. */
+static void permission_failure(void)
+{
+#ifdef UF_IMMUTABLE
+    char full[1024];
+
+    write_local("/perm-immutable", "x");
+    snprintf(full, sizeof full, "%s/perm-immutable", g_root);
+    if (chflags(full, UF_IMMUTABLE) == 0) {
+        CHECK(files_ensure_0777(full, -1) != 0);
+        CHECK(chflags(full, 0) == 0);
+    }
+#endif
+}
+
 static int write_small(const char *path)
 {
     char full[1024];
@@ -584,6 +670,8 @@ int main(void)
     downloads();
     changes();
     jobs();
+    permissions();
+    permission_failure();
     disk_speed();
     noted_upload();
     shared_transfers();
