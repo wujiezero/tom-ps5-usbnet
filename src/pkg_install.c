@@ -26,7 +26,7 @@
 #define PKG_STALL_MS 60000L
 #define PKG_SMB_ERR_WAIT_MS 5000L
 #define PKG_NEED_TIMEOUT_MS 1000
-#define PKG_MAX_BROWSER_CHUNK (4 * 1024 * 1024)
+#define PKG_MAX_BROWSER_CHUNK (8 * 1024 * 1024)
 #define APPINST_ERR_NO_SPACE_1 0x80990005u
 #define APPINST_ERR_NO_SPACE_2 0x8099000fu
 #define APPINST_ERR_CANCELED 0x80900013u
@@ -49,6 +49,8 @@ static void (*g_log)(const char *);
 static pthread_mutex_t g_browser_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_browser_done = PTHREAD_COND_INITIALIZER;
 static struct pkg_stream *g_browser_stream;
+static char g_browser_label[256];
+static uint64_t g_browser_size;
 static int g_browser_starting;
 static int g_browser_refs;
 
@@ -237,6 +239,12 @@ static const char *run_appinst_loop(struct pkg_stream *stream, uint64_t size, co
         pkg_appinst_cancel(cid);
         code = "canceled";
     }
+    if (g_log) {
+        char msg[128];
+
+        snprintf(msg, sizeof msg, "pkg: stream served=%" PRIu64 " code=%s", pkg_stream_served(stream), code ? code : "ok");
+        g_log(msg);
+    }
     return code;
 }
 
@@ -299,6 +307,12 @@ static void *pkg_install_thread(void *arg)
         return NULL;
     }
     extract_header_cid(hdr, header_cid);
+    if (g_log) {
+        char msg[128];
+
+        snprintf(msg, sizeof msg, "pkg: smb magic=%02x%02x%02x%02x size=%" PRIu64, hdr[0], hdr[1], hdr[2], hdr[3], entry.size);
+        g_log(msg);
+    }
 
     (void)files_job_size(entry.size);
     if (files_job_canceled()) {
@@ -373,6 +387,8 @@ static void *pkg_browser_thread(void *arg)
 
     pthread_mutex_lock(&g_browser_lock);
     g_browser_stream = stream;
+    snprintf(g_browser_label, sizeof g_browser_label, "%s", j->label);
+    g_browser_size = j->size;
     g_browser_starting = 0;
     pthread_mutex_unlock(&g_browser_lock);
 
@@ -380,6 +396,8 @@ static void *pkg_browser_thread(void *arg)
 
     pthread_mutex_lock(&g_browser_lock);
     g_browser_stream = NULL;
+    g_browser_label[0] = 0;
+    g_browser_size = 0;
     pkg_stream_signal_stop(stream);
     while (g_browser_refs > 0) pthread_cond_wait(&g_browser_done, &g_browser_lock);
     pthread_mutex_unlock(&g_browser_lock);
@@ -473,6 +491,12 @@ static int browser_start(const struct http_request *r, struct http_stream *strea
 
     j = calloc(1, sizeof *j);
     if (!j) return error_json(stream, 503, "no_memory");
+    if (g_log) {
+        char msg[128];
+
+        snprintf(msg, sizeof msg, "pkg: browser magic=%02x%02x%02x%02x size=%" PRIu64, hdr[0], hdr[1], hdr[2], hdr[3], size);
+        g_log(msg);
+    }
     snprintf(j->label, sizeof j->label, "%s", name);
     extract_header_cid(hdr, j->header_cid);
     j->size = size;
@@ -548,6 +572,48 @@ static int browser_chunk(const struct http_request *r, struct http_stream *strea
     return http_respond(stream, 200, "application/json", "{}");
 }
 
+static void json_escape(char *dst, size_t cap, const char *s)
+{
+    size_t used = 0;
+    const unsigned char *p = (const unsigned char *)s;
+
+    if (!cap) return;
+    while (*p && used + 1 < cap) {
+        if (*p == '"' || *p == '\\') {
+            if (used + 2 >= cap) break;
+            dst[used++] = '\\';
+            dst[used++] = (char)*p++;
+        } else if (*p < 0x20) {
+            if (used + 6 >= cap) break;
+            snprintf(dst + used, cap - used, "\\u%04x", *p++);
+            used += 6;
+        } else {
+            dst[used++] = (char)*p++;
+        }
+    }
+    dst[used] = 0;
+}
+
+static int browser_status(struct http_stream *stream)
+{
+    char label[256], esc[600], json[700];
+    uint64_t size = 0, done = 0;
+    int active = 0;
+
+    pthread_mutex_lock(&g_browser_lock);
+    if (g_browser_stream) {
+        active = 1;
+        snprintf(label, sizeof label, "%s", g_browser_label);
+        size = g_browser_size;
+        done = pkg_stream_served(g_browser_stream);
+    }
+    pthread_mutex_unlock(&g_browser_lock);
+    if (!active) return http_respond(stream, 200, "application/json", "{\"active\":false}");
+    json_escape(esc, sizeof esc, label);
+    snprintf(json, sizeof json, "{\"active\":true,\"name\":\"%s\",\"size\":%" PRIu64 ",\"done\":%" PRIu64 "}", esc, size, done);
+    return http_respond(stream, 200, "application/json", json);
+}
+
 int pkg_install_route(const struct http_request *r, struct http_stream *stream)
 {
     const char *path = r->path;
@@ -556,6 +622,7 @@ int pkg_install_route(const struct http_request *r, struct http_stream *stream)
     if (strncmp(path, "/pkg/browser/", 13)) return HTTP_NOT_MINE;
     path += 13;
     if (post && !strcmp(path, "start")) return browser_start(r, stream);
+    if (!post && !strcmp(path, "status")) return browser_status(stream);
     if (!post && !strcmp(path, "need")) return browser_need(stream);
     if (post && !strcmp(path, "chunk")) return browser_chunk(r, stream);
     return HTTP_NOT_MINE;

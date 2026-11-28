@@ -34,9 +34,9 @@
 #define STREAM_MAX_CHUNK (1024 * 1024)
 #define STREAM_MIN_CHUNK (64 * 1024)
 #define STREAM_SMB_RETRIES 2
-#define STREAM_BROWSER_CHUNK (2 * 1024 * 1024)
+#define STREAM_BROWSER_CHUNK (4 * 1024 * 1024)
 #define STREAM_PULL_SLOTS 4
-#define STREAM_PULL_WAIT_MS 30000
+#define STREAM_PULL_WAIT_MS 180000
 
 enum pull_state { PULL_FREE, PULL_NEEDED, PULL_INFLIGHT, PULL_READY, PULL_ERROR };
 
@@ -77,6 +77,7 @@ struct pkg_stream {
     pthread_cond_t done_cond;
     int active_workers;
     int active_fds[STREAM_MAX_WORKERS];
+    int logged_reqs;
 
     pthread_mutex_t pool_lock;
     struct smb_slot pool[STREAM_MAX_WORKERS];
@@ -87,6 +88,12 @@ struct pkg_stream {
 };
 
 static uint64_t g_next_pull_id = 1;
+static void (*g_stream_log)(const char *);
+
+void pkg_stream_set_log(void (*log)(const char *line))
+{
+    g_stream_log = log;
+}
 
 struct stream_worker_arg {
     struct pkg_stream *st;
@@ -630,6 +637,15 @@ static void *worker_main(void *opaque)
                 length, st->etag, st->last_modified, keep_alive ? "keep-alive" : "close");
         }
         if (hlen <= 0 || fd_write_all(fd, hdr, (size_t)hlen) != 0) break;
+        if (g_stream_log && __atomic_fetch_add(&st->logged_reqs, 1, __ATOMIC_RELAXED) < 8) {
+            char msg[160];
+
+            if (partial)
+                snprintf(msg, sizeof msg, "pkg-stream: %s 206 range=%" PRIu64 "-%" PRIu64 "/%" PRIu64, method, first, last, st->size);
+            else
+                snprintf(msg, sizeof msg, "pkg-stream: %s 200 size=%" PRIu64, method, st->size);
+            g_stream_log(msg);
+        }
         if (!is_head && length > 0) {
             int rc = st->browser_mode ? stream_range_from_browser(st, fd, first, length) : stream_range_from_smb(st, fd, first, length);
 

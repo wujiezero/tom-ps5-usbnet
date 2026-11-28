@@ -12,6 +12,9 @@
 
 struct pkg_stream;
 
+/* Optional log callback (never receives filenames, tokens, or IP addresses). */
+void pkg_stream_set_log(void (*log)(const char *line));
+
 /* Starts listening on 127.0.0.1 (ephemeral port) backed by an SMB share file.
  * On success (returns 0), takes ownership of `initial_session` and `initial_file`;
  * on failure (returns -1), caller keeps them. */

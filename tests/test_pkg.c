@@ -37,11 +37,14 @@ struct memory {
     size_t out_length;
 };
 
-static char g_root[256], g_nas[300], g_volume[300], g_last_log[192];
+static char g_root[256], g_nas[300], g_volume[300], g_last_log[2048];
 
 static void record_log(const char *line)
 {
-    snprintf(g_last_log, sizeof g_last_log, "%s", line);
+    size_t cur = strlen(g_last_log);
+
+    if (cur + strlen(line) + 2 < sizeof g_last_log)
+        snprintf(g_last_log + cur, sizeof g_last_log - cur, "%s\n", line);
 }
 
 static ssize_t memory_read(void *context, void *data, size_t length)
@@ -510,6 +513,37 @@ static void *browser_pull_worker(void *opaque)
     return NULL;
 }
 
+static void *browser_pull_one_and_leave(void *arg)
+{
+    struct browser_pull_arg *a = arg;
+    FILE *f = fopen(a->file_path, "rb");
+    int i;
+
+    CHECK(f);
+    for (i = 0; i < 40; i++) {
+        char *body = NULL;
+        uint64_t req = 0, off = 0;
+        size_t len = 0;
+
+        CHECK(fs_request("GET", "/pkg/browser/need", NULL, &body) == 200);
+        if (sscanf(body, "{\"req\":%" PRIu64 ",\"offset\":%" PRIu64 ",\"len\":%zu}", &req, &off, &len) == 3) {
+            uint8_t *buf = malloc(len);
+            char target[128], *cbody = NULL;
+
+            CHECK(buf && fseeko(f, (off_t)off, SEEK_SET) == 0 && fread(buf, 1, len, f) == len);
+            snprintf(target, sizeof target, "/pkg/browser/chunk?req=%" PRIu64, req);
+            (void)fs_request_bin("POST", target, buf, len, &cbody);
+            free(cbody);
+            free(buf);
+            free(body);
+            break;
+        }
+        free(body);
+    }
+    fclose(f);
+    return NULL;
+}
+
 static void test_browser_streaming(void)
 {
     char local_pkg[600], target[512], *body = NULL;
@@ -518,6 +552,10 @@ static void test_browser_streaming(void)
     uint32_t expected_hash;
     pthread_t p1, p2;
     struct browser_pull_arg arg = {.file_path = local_pkg};
+
+    CHECK(fs_request("GET", "/pkg/browser/status", NULL, &body) == 200);
+    CHECK(strstr(body, "\"active\":false"));
+    free(body);
 
     snprintf(local_pkg, sizeof local_pkg, "%s/browser.pkg", g_root);
     write_fake_pkg(local_pkg, 200 * 1024, 1);
@@ -567,6 +605,37 @@ static void test_browser_streaming(void)
     pthread_join(p2, NULL);
     CHECK(pkg_stub_verified_bytes == 200 * 1024);
     CHECK(pkg_stub_hash == expected_hash);
+
+    /* Simulate browser refresh/reconnect mid-transfer via /pkg/browser/status on a >4MiB PKG */
+    {
+        char big_pkg[600], big_target[512];
+        size_t big_sz = 5 * 1024 * 1024;
+        uint32_t big_hash;
+        struct browser_pull_arg big_arg = {.file_path = big_pkg};
+
+        snprintf(big_pkg, sizeof big_pkg, "%s/resume.pkg", g_root);
+        write_fake_pkg(big_pkg, big_sz, 1);
+        big_hash = fnv1a_file(big_pkg, 0, big_sz);
+        snprintf(big_target, sizeof big_target, "/pkg/browser/start?name=resume.pkg&size=%zu&mtime=1700000000&client=br1", big_sz);
+        pkg_stub_delay_ms = 0;
+        pkg_stub_verified_bytes = 0;
+        pkg_stub_hash = 0;
+        CHECK(fs_request_bin("POST", big_target, hdr, sizeof hdr, &body) == 200);
+        free(body);
+        CHECK(pthread_create(&p1, NULL, browser_pull_one_and_leave, &big_arg) == 0);
+        pthread_join(p1, NULL);
+        CHECK(fs_request("GET", "/pkg/browser/status", NULL, &body) == 200);
+        CHECK(strstr(body, "\"active\":true") && strstr(body, "\"name\":\"resume.pkg\"") && strstr(body, "\"size\":5242880"));
+        free(body);
+        CHECK(pthread_create(&p2, NULL, browser_pull_worker, &big_arg) == 0);
+        wait_job("\"state\":\"done\"");
+        pthread_join(p2, NULL);
+        CHECK(pkg_stub_verified_bytes == big_sz);
+        CHECK(pkg_stub_hash == big_hash);
+        CHECK(fs_request("GET", "/pkg/browser/status", NULL, &body) == 200);
+        CHECK(strstr(body, "\"active\":false"));
+        free(body);
+    }
 
     /* Cancel mid-transfer */
     pkg_stub_delay_ms = 40;
